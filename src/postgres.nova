@@ -1,0 +1,639 @@
+// postgres.nova — the PostgreSQL driver, implementing the `db` seam (db.Connection /
+// db.Driver) over the PostgreSQL v3 frontend/backend wire protocol. The reference SQL
+// driver: the encoding + auth patterns extract to MySQL/MSSQL.
+//
+// Differs from the BTreeDB driver (which is pg-INSPIRED) in the real-pg specifics:
+//   - the Startup message has NO type byte (just length + protocol version + cstring params);
+//   - field names and the query SQL are C-strings (NUL-terminated), not length-prefixed;
+//   - PostgreSQL's own type OIDs (int4=23, text=25, numeric=1700, …);
+//   - an auth handshake (AuthenticationOk / Cleartext / MD5);
+//   - ErrorResponse is a series of tagged C-strings, not three str16s.
+//
+//   let drv = PgDriver();
+//   let conn = drv.connect("postgresql://user@127.0.0.1:5432/mydb");
+//   let rs = conn.query("SELECT id, name FROM users", List<DbValue>());
+//   let id = rs.row(0).getInt(0);   // typed
+//
+// The wire CODEC (frame build + response decode) is pure over byte buffers, gated offline;
+// connect/query wire it to a TcpStream and are live-verified against a running PostgreSQL.
+import net.asyncio;
+import bytes;
+import string;
+import list;
+import db;
+import crypto.scram;
+// The SCRAM client nonce is drawn straight from the CSPRNG runtime builtin (`nova_random_hex`,
+// the same primitive crypto.random wraps) rather than importing the crypto.random MODULE — that
+// keeps its unrelated @test suite out of every program that imports this widely-used driver.
+
+// --- PostgreSQL type OIDs -> seam DbType --------------------------------------
+fn oidToDbType(oid: int): DbType {
+    if (oid == 16) { return DbType.Bool; }        // bool
+    if (oid == 20) { return DbType.Int8; }        // int8
+    if (oid == 21) { return DbType.Int4; }        // int2 -> Int4
+    if (oid == 23) { return DbType.Int4; }        // int4
+    if (oid == 26) { return DbType.Uint4; }       // oid
+    if (oid == 700) { return DbType.Float4; }     // float4
+    if (oid == 701) { return DbType.Float8; }     // float8
+    if (oid == 1700) { return DbType.Decimal; }   // numeric
+    if (oid == 1114) { return DbType.Timestamp; } // timestamp
+    if (oid == 1184) { return DbType.Timestamp; } // timestamptz
+    if (oid == 17) { return DbType.Blob; }        // bytea
+    // text(25) / varchar(1043) / bpchar(1042) / name(19) / anything else -> Text
+    return DbType.Text;
+}
+
+// --- PgFrame writers — binary-safe Nova strings ---------------------------------
+fn byte1(b: int): string {
+    let p = bytes.alloc(1);
+    bytes.write_byte(p, 0, b);
+    return p as string;
+}
+fn i32be(v: int): string {
+    let p = bytes.alloc(4);
+    bytes.write_byte(p, 0, (v / 16777216) % 256);
+    bytes.write_byte(p, 1, (v / 65536) % 256);
+    bytes.write_byte(p, 2, (v / 256) % 256);
+    bytes.write_byte(p, 3, v % 256);
+    return p as string;
+}
+fn cstr(s: string): string { return s + byte1(0); }
+
+// A typed message: [type:byte][len:i32 including itself][payload].
+fn typedFrame(t: int, payload: string): string {
+    return byte1(t) + i32be(4 + payload.length) + payload;
+}
+
+/// Startup: NO type byte. [len i32][protocol 196608][key\0 value\0 ...][\0].
+pub fn buildStartup(user: string, database: string): string {
+    let params = cstr("user") + cstr(user) + cstr("database") + cstr(database)
+        + cstr("application_name") + cstr("nova-pg") + byte1(0);
+    let body = i32be(196608) + params;   // protocol 3.0 = 0x00030000
+    return i32be(4 + body.length) + body;
+}
+pub fn buildQuery(sql: string): string { return typedFrame(81, cstr(sql)); }  // 'Q'
+pub fn buildPassword(pw: string): string { return typedFrame(112, cstr(pw)); } // 'p'
+pub fn buildTerminate(): string { return typedFrame(88, ""); }                 // 'X'
+
+// --- D6: SASL / SCRAM-SHA-256 auth (AuthenticationSASL flow) ------------------
+// SASLInitialResponse ('p'): [mechanism cstr][i32 len of client-first][client-first bytes].
+pub fn buildSASLInitial(mechanism: string, clientFirst: string): string {
+    return typedFrame(112, cstr(mechanism) + i32be(clientFirst.length) + clientFirst);
+}
+// SASLResponse ('p'): the raw client-final-message bytes (the frame length bounds it).
+pub fn buildSASLResponse(clientFinal: string): string {
+    return typedFrame(112, clientFinal);
+}
+
+fn i16be(v: int): string {
+    let p = bytes.alloc(2);
+    bytes.write_byte(p, 0, (v / 256) % 256);
+    bytes.write_byte(p, 1, v % 256);
+    return p as string;
+}
+
+// --- D6: extended-query (prepared statement) frame builders -------------------
+// Parse ('P'): create a named prepared statement. 0 param type OIDs => let the server infer.
+pub fn buildParse(name: string, sql: string): string {
+    return typedFrame(80, cstr(name) + cstr(sql) + i16be(0));
+}
+// Describe ('D') a STATEMENT ('S'=83): asks for ParameterDescription + RowDescription/NoData.
+pub fn buildDescribeStmt(name: string): string {
+    return typedFrame(68, byte1(83) + cstr(name));
+}
+// Sync ('S'): flush + end the extended-query sequence; the server replies ReadyForQuery.
+pub fn buildSync(): string { return typedFrame(83, ""); }
+// Execute ('E') a portal, `maxRows`=0 meaning "all rows".
+pub fn buildExecute(portal: string, maxRows: int): string {
+    return typedFrame(69, cstr(portal) + i32be(maxRows));
+}
+// A parameter value in Bind's TEXT format (all format codes 0) — the server parses it per the
+// prepared statement's inferred param type, so this is the raw unquoted text (unlike the
+// client-side `valueToSql`, which quotes/escapes for inline interpolation).
+fn valueToBindText(v: DbValue): string {
+    if (v.kind == DbType.Bool) { if (v.asBool()) { return "t"; } return "f"; }
+    if (v.kind == DbType.Text || v.kind == DbType.Blob) { return v.asText(); }
+    if (v.kind == DbType.Decimal) { return v.asText(); }
+    if (v.kind == DbType.Float4 || v.kind == DbType.Float8) { let d = v.asDouble(); return `${d}`; }
+    let iv = v.asLong();
+    return `${iv}`;
+}
+// Bind ('B'): bind `params` (all TEXT format) to the unnamed portal for statement `name`.
+pub fn buildBind(portal: string, name: string, params: List<DbValue>): string {
+    let body = cstr(portal) + cstr(name) + i16be(0) + i16be(params.size());
+    let i = 0;
+    while (i < params.size()) {
+        let p = params.get(i) ?? db.dbNull();
+        if (p.isNull()) {
+            // length -1 signals SQL NULL — four 0xFF bytes.
+            body = body + byte1(255) + byte1(255) + byte1(255) + byte1(255);
+        } else {
+            let t = valueToBindText(p);
+            body = body + i32be(t.length) + t;
+        }
+        i = i + 1;
+    }
+    body = body + i16be(0);   // 0 result-format codes => all columns returned as text
+    return typedFrame(66, body);
+}
+// Copy a column list (cached RowDescription) into a fresh owned list — Execute does not resend
+// RowDescription, so a prepared query reuses the cached columns; copying avoids aliasing the
+// cached list into the ResultSet (both would then free it).
+fn copyColumns(src: List<Column>): List<Column> {
+    let out = List<Column>();
+    let i = 0;
+    while (i < src.size()) {
+        let c = src.get(i) ?? Column("", DbType.Text);
+        out.push(Column(c.name, c.type_oid));
+        i = i + 1;
+    }
+    return out;
+}
+
+// --- Payload cursor (decode, pure over a byte-buffer string) ------------------
+struct PgCursor {
+    pub s: string,
+    pub pos: int,
+    init(s: string) { self.s = s; self.pos = 0; }
+
+    pub fn byte(self: PgCursor): int {
+        let b = self.s[self.pos];
+        self.pos = self.pos + 1;
+        return b;
+    }
+    pub fn i16(self: PgCursor): int {
+        let hi = self.byte();
+        let lo = self.byte();
+        return hi * 256 + lo;
+    }
+    pub fn i32(self: PgCursor): int {
+        let a = self.byte();
+        let b = self.byte();
+        let c = self.byte();
+        let d = self.byte();
+        return ((a * 256 + b) * 256 + c) * 256 + d;
+    }
+    // A NUL-terminated C-string.
+    pub fn cstr(self: PgCursor): string {
+        let start = self.pos;
+        while (self.s[self.pos] != 0) { self.pos = self.pos + 1; }
+        let out = string.slice(self.s, start, self.pos);
+        self.pos = self.pos + 1;   // skip the NUL
+        return out;
+    }
+    pub fn take(self: PgCursor, n: int): string {
+        let out = string.slice(self.s, self.pos, self.pos + n);
+        self.pos = self.pos + n;
+        return out;
+    }
+    pub fn skip(self: PgCursor, n: int): void { self.pos = self.pos + n; }
+}
+
+// --- Response decoders (pure; the offline gate calls these directly) ----------
+
+/// RowDescription ('T'): field_count(i16) + per field {name(cstr), table_oid(i32),
+/// col_attr(i16), type_oid(i32), type_size(i16), type_mod(i32), format(i16)}.
+pub fn decodeRowDesc(payload: string): List<Column> {
+    let cols = List<Column>();
+    let c = PgCursor(payload);
+    let n = c.i16();
+    let i = 0;
+    while (i < n) {
+        let name = c.cstr();
+        c.skip(4);           // table_oid
+        c.skip(2);           // col_attr
+        let oid = c.i32();   // type_oid
+        c.skip(2);           // type_size
+        c.skip(4);           // type_mod
+        c.skip(2);           // format
+        cols.push(Column(name, oidToDbType(oid)));
+        i = i + 1;
+    }
+    return cols;
+}
+
+// Decode one text-format value into a typed cell for the column type.
+fn decodeCell(t: DbType, raw: string, isNull: bool): DbValue {
+    if (isNull) { return db.dbNull(); }
+    if (t == DbType.Bool) {
+        let tru = string.eql(raw, "t") || string.eql(raw, "true") || string.eql(raw, "1");
+        return db.dbBool(tru);
+    }
+    if (t == DbType.Int4 || t == DbType.Uint4) { return db.dbInt(string.parseI64(raw)); }
+    if (t == DbType.Int8 || t == DbType.Uint8 || t == DbType.Timestamp) { return db.dbLong(string.parseI64(raw)); }
+    if (t == DbType.Float4 || t == DbType.Float8) { return db.dbDouble(string.parseFloat(raw)); }
+    if (t == DbType.Decimal) {
+        // S4: numeric arrives as text — parse it into an EXACT decimal128 (.dec, via asDecimal())
+        // while keeping the raw text in .s (asText) for callers that still want the string form.
+        return DbValue(DbType.Decimal, 0, 0.0, decimal.fromString(raw), raw);
+    }
+    return db.dbText(raw);   // text / varchar / bytea
+}
+
+/// DataRow ('D'): field_count(i16) + per field {len(i32, -1=NULL), bytes}.
+pub fn decodeDataRow(payload: string, cols: List<Column>): Row {
+    let row = Row();
+    let c = PgCursor(payload);
+    let n = c.i16();
+    let i = 0;
+    while (i < n) {
+        let len = c.i32();
+        let col = cols.get(i) ?? Column("", DbType.Text);
+        // -1 length = NULL; reads back as signed i32 -1 or 4294967295 depending on int width.
+        if (len == 4294967295 || len == -1) {
+            row.cells.push(decodeCell(col.type_oid, "", true));
+        } else {
+            row.cells.push(decodeCell(col.type_oid, c.take(len), false));
+        }
+        i = i + 1;
+    }
+    return row;
+}
+
+/// CommandComplete ('C') -> tag cstring (e.g. "SELECT 2", "INSERT 0 1").
+pub fn decodeTag(payload: string): string {
+    let c = PgCursor(payload);
+    return c.cstr();
+}
+
+/// ErrorResponse ('E'): a series of {field_tag(byte), value(cstr)} ending at a 0 tag.
+/// We pull 'C' (SQLSTATE code) and 'M' (message).
+pub fn decodeError(payload: string): DbError {
+    let c = PgCursor(payload);
+    let code = "";
+    let msg = "";
+    while (true) {
+        let tag = c.byte();
+        if (tag == 0) { break; }
+        let val = c.cstr();
+        if (tag == 67) { code = val; }   // 'C' SQLSTATE
+        if (tag == 77) { msg = val; }    // 'M' message
+    }
+    return DbError(code, msg);
+}
+
+// "SELECT 2" / "INSERT 0 1" / "UPDATE 3" -> the trailing count.
+fn tagCount(tag: string): int {
+    let sp = string.lastIndexOf(tag, " ");
+    if (sp == -1) { return 0; }
+    let num = string.slice(tag, sp + 1, tag.length);
+    return string.parseI64(num);
+}
+
+// --- Buffered frame reader over a live ASYNC stream ---------------------------
+// A1 async-first seam: the reader's socket I/O is non-blocking — `fill` awaits `io.recvInto`,
+// which PARKS the coroutine (asio arecv) instead of blocking the scheduler thread. `io` is an
+// AsyncStream; a TLS variant (TlsStream) drops in unchanged via the shared recvInto shape.
+struct PgReader {
+    pub io: asyncio.AsyncStream,
+    pub buf: ptr,
+    pub cap: int,
+    pub len: int,
+    pub pos: int,
+    init(io: asyncio.AsyncStream) {
+        self.io = io;
+        self.cap = 65536;
+        self.buf = bytes.alloc(65536);
+        self.len = 0;
+        self.pos = 0;
+    }
+}
+async fn fill(r: PgReader): bool {
+    if (r.pos > 0) {
+        let i = 0;
+        while (r.pos + i < r.len) {
+            bytes.write_byte(r.buf, i, bytes.read_byte(r.buf, r.pos + i));
+            i = i + 1;
+        }
+        r.len = r.len - r.pos;
+        r.pos = 0;
+    }
+    let space = r.cap - r.len;
+    let n = await r.io.recvInto((r.buf + r.len) as int, space);   // parks the coroutine, no thread held
+    if (n <= 0) { return false; }
+    r.len = r.len + n;
+    return true;
+}
+async fn need(r: PgReader, k: int): bool {
+    while (r.len - r.pos < k) { if (!(await fill(r))) { return false; } }
+    return true;
+}
+fn rbyte(r: PgReader): int { let b = bytes.read_byte(r.buf, r.pos); r.pos = r.pos + 1; return b; }
+fn ri32(r: PgReader): int {
+    let a = rbyte(r); let b = rbyte(r); let c = rbyte(r); let d = rbyte(r);
+    return ((a * 256 + b) * 256 + c) * 256 + d;
+}
+
+struct PgFrame {
+    pub ftype: int,
+    pub payload: string,
+    init(ftype: int, payload: string) { self.ftype = ftype; self.payload = payload; }
+}
+async fn readFrame(r: PgReader): PgFrame {
+    if (!(await need(r, 5))) { return PgFrame(-1, ""); }
+    let t = rbyte(r);
+    let len = ri32(r);
+    let plen = len - 4;
+    // Defensive: a corrupt/partial length (server crashed mid-stream or protocol
+    // desync) must not reach bytes.alloc — a negative or multi-GB plen segfaults the
+    // client. Treat as a broken connection; callers already handle the -1 frame.
+    if (plen < 0 || plen > 67108864) { return PgFrame(-1, ""); }
+    if (plen > 0) {
+        if (!(await need(r, plen))) { return PgFrame(-1, ""); }
+    }
+    let out = bytes.alloc(plen);
+    let i = 0;
+    while (i < plen) {
+        bytes.write_byte(out, i, bytes.read_byte(r.buf, r.pos + i));
+        i = i + 1;
+    }
+    r.pos = r.pos + plen;
+    return PgFrame(t, out as string);
+}
+
+async fn sendFrame(io: asyncio.AsyncStream, frame: string): int {
+    return await io.sendStr(frame);
+}
+
+// A server-side prepared statement: the Parse name, the SQL (for dedup), and the RowDescription
+// columns captured at Describe time (Execute never resends them).
+struct PgStmt {
+    pub name: string,
+    pub sql: string,
+    pub cols: List<Column>,
+    init(name: string, sql: string, cols: List<Column>) {
+        self.name = name;
+        self.sql = sql;
+        self.cols = cols;
+    }
+}
+
+// --- The seam implementation --------------------------------------------------
+
+pub struct PgConnection impl Connection {
+    pub io: asyncio.AsyncStream,
+    pub reader: PgReader,
+    pub stmts: List<PgStmt>,     // D6: per-connection prepared-statement cache
+    init(io: asyncio.AsyncStream, reader: PgReader) {
+        self.io = io;
+        self.reader = reader;
+        self.stmts = List<PgStmt>();
+    }
+
+    pub async fn query(self, sql: string, params: List<DbValue>): ResultSet {
+        let sn = await sendFrame(self.io, buildQuery(substituteParams(sql, params)));
+        let rs = ResultSet();
+        while (true) {
+            let f = await readFrame(self.reader);
+            if (f.ftype == -1) { break; }
+            if (f.ftype == 90) { break; }                                    // 'Z' ReadyForQuery
+            if (f.ftype == 84) { rs.columns = decodeRowDesc(f.payload); }    // 'T'
+            if (f.ftype == 68) { rs.rows.push(decodeDataRow(f.payload, rs.columns)); } // 'D'
+            if (f.ftype == 67) {                                             // 'C'
+                rs.tag = decodeTag(f.payload);
+                rs.rows_affected = tagCount(rs.tag);
+            }
+        }
+        return rs;
+    }
+
+    pub async fn exec(self, sql: string, params: List<DbValue>): ExecResult {
+        let sn = await sendFrame(self.io, buildQuery(substituteParams(sql, params)));
+        let tag = "";
+        while (true) {
+            let f = await readFrame(self.reader);
+            if (f.ftype == -1) { break; }
+            if (f.ftype == 90) { break; }
+            if (f.ftype == 67) { tag = decodeTag(f.payload); }
+        }
+        return ExecResult(tagCount(tag), tag);
+    }
+
+    pub fn close(self): void {
+        // Sync trait method — just close the socket. A graceful Terminate would need an async send,
+        // which cannot be driven here: close is often called from INSIDE a coroutine (e.g. to cancel
+        // a timed-out query and drain its future), where a nested drive would deadlock nova_run_root.
+        // An abrupt close is fine — the server tears the connection down.
+        self.io.close();
+    }
+
+    pub fn setTimeout(self, ms: int): int {   // D6 — async per-recv awaited deadline
+        return self.io.setTimeout(ms);
+    }
+
+    // D6 prepared statements (real server-side extended query). Parse + Describe the SQL once,
+    // cache the assigned name + RowDescription columns, and reuse across executions — the server
+    // parses/plans a given SQL a single time. Deduplicated: preparing the same SQL again returns
+    // the existing handle with no round-trip.
+    pub async fn prepare(self, sql: string): int {
+        let i = 0;
+        while (i < self.stmts.size()) {
+            let s = self.stmts.get(i) ?? PgStmt("", "", List<Column>());
+            if (string.eql(s.sql, sql)) { return i; }
+            i = i + 1;
+        }
+        let idx = self.stmts.size();
+        let name = `nova_s${idx}`;
+        let s1 = await sendFrame(self.io, buildParse(name, sql));
+        let s2 = await sendFrame(self.io, buildDescribeStmt(name));
+        let s3 = await sendFrame(self.io, buildSync());
+        let cols = List<Column>();
+        while (true) {
+            let f = await readFrame(self.reader);
+            if (f.ftype == -1) { break; }
+            if (f.ftype == 90) { break; }                          // 'Z' ReadyForQuery
+            if (f.ftype == 84) { cols = decodeRowDesc(f.payload); } // 'T' RowDescription
+            if (f.ftype == 69) { break; }                          // 'E' ErrorResponse
+            // '1' ParseComplete / 't' ParameterDescription / 'n' NoData — nothing to capture.
+        }
+        self.stmts.push(PgStmt(name, sql, cols));
+        return idx;
+    }
+
+    pub async fn queryPrepared(self, stmt: int, params: List<DbValue>): ResultSet {
+        let rs = ResultSet();
+        if (stmt < 0 || stmt >= self.stmts.size()) { return rs; }
+        let s = self.stmts.get(stmt) ?? PgStmt("", "", List<Column>());
+        rs.columns = copyColumns(s.cols);      // Execute won't resend RowDescription
+        let s1 = await sendFrame(self.io, buildBind("", s.name, params));
+        let s2 = await sendFrame(self.io, buildExecute("", 0));
+        let s3 = await sendFrame(self.io, buildSync());
+        while (true) {
+            let f = await readFrame(self.reader);
+            if (f.ftype == -1) { break; }
+            if (f.ftype == 90) { break; }                                            // 'Z'
+            if (f.ftype == 68) { rs.rows.push(decodeDataRow(f.payload, rs.columns)); } // 'D'
+            if (f.ftype == 67) {                                                      // 'C'
+                rs.tag = decodeTag(f.payload);
+                rs.rows_affected = tagCount(rs.tag);
+            }
+            if (f.ftype == 69) { break; }                                            // 'E'
+            // '2' BindComplete — nothing to do.
+        }
+        return rs;
+    }
+
+    pub async fn execPrepared(self, stmt: int, params: List<DbValue>): ExecResult {
+        if (stmt < 0 || stmt >= self.stmts.size()) { return ExecResult(0, ""); }
+        let s = self.stmts.get(stmt) ?? PgStmt("", "", List<Column>());
+        let s1 = await sendFrame(self.io, buildBind("", s.name, params));
+        let s2 = await sendFrame(self.io, buildExecute("", 0));
+        let s3 = await sendFrame(self.io, buildSync());
+        let tag = "";
+        while (true) {
+            let f = await readFrame(self.reader);
+            if (f.ftype == -1) { break; }
+            if (f.ftype == 90) { break; }               // 'Z'
+            if (f.ftype == 67) { tag = decodeTag(f.payload); }
+            if (f.ftype == 69) { break; }               // 'E'
+        }
+        return ExecResult(tagCount(tag), tag);
+    }
+}
+
+// Client-side $1..$N substitution with SQL-standard escaping (text single-quoted with
+// doubled quotes) — used by `query`/`exec`. Prepared statements above avoid it entirely.
+fn escapeText(s: string): string {
+    let out = "'";
+    let i = 0;
+    let n = s.length;
+    while (i < n) {
+        if (s[i] == 39) { out = out + "''"; } else { out = out + string.slice(s, i, i + 1); }
+        i = i + 1;
+    }
+    return out + "'";
+}
+fn valueToSql(v: DbValue): string {
+    if (v.isNull()) { return "NULL"; }
+    if (v.kind == DbType.Bool) { if (v.asBool()) { return "true"; } return "false"; }
+    if (v.kind == DbType.Text || v.kind == DbType.Blob) { return escapeText(v.asText()); }
+    if (v.kind == DbType.Decimal) { return v.asText(); }
+    if (v.kind == DbType.Float4 || v.kind == DbType.Float8) { let d = v.asDouble(); return `${d}`; }
+    let iv = v.asLong();
+    return `${iv}`;
+}
+pub fn substituteParams(sql: string, params: List<DbValue>): string {
+    let out = "";
+    let i = 0;
+    let n = sql.length;
+    while (i < n) {
+        if (sql[i] == 36 && i + 1 < n) {   // '$'
+            let d = sql[i + 1];
+            if (d >= 49 && d <= 57) {      // $1..$9
+                let p = params.get(d - 49) ?? db.dbNull();
+                out = out + valueToSql(p);
+                i = i + 2;
+            } else {
+                out = out + "$";
+                i = i + 1;
+            }
+        } else {
+            out = out + string.slice(sql, i, i + 1);
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+/// The PostgreSQL driver. DSN: `postgresql://user@host:port/database` (password optional
+/// as `user:password@`). Handles the startup handshake incl. AuthenticationOk / Cleartext /
+/// MD5, then reads ParameterStatus/BackendKeyData until ReadyForQuery.
+// The whole connect + startup handshake as ONE async fn (one await-chain, driven once by the
+// synchronous Driver.connect). Every socket op parks the coroutine; a single drive pumps the
+// asio io_context through the entire handshake.
+async fn pgConnectAsync(dsn: string): PgConnection {
+    let d = parseDsn(dsn);
+    let stream = await asyncio.asyncConnect(d.host, d.port);
+    let reader = PgReader(stream);
+    let sn = await sendFrame(stream, buildStartup(d.user, d.database));
+
+    // D6: a SCRAM-SHA-256 exchange spans several 'R' messages, so the ScramClient (holding
+    // username/password/client-nonce) lives across the loop. Nonce = 36 hex chars (CSPRNG).
+    let scram = ScramClient{ username: d.user, password: d.password, clientNonce: nova_random_hex(18) };
+
+    while (true) {
+        let f = await readFrame(reader);
+        if (f.ftype == -1) { break; }
+        if (f.ftype == 90) { break; }   // 'Z' ReadyForQuery — handshake done
+        if (f.ftype == 82) {            // 'R' Authentication
+            let c = PgCursor(f.payload);
+            let kind = c.i32();
+            if (kind == 3) {            // cleartext password
+                let a1 = await sendFrame(stream, buildPassword(d.password));
+            }
+            if (kind == 10) {           // AuthenticationSASL — offer SCRAM-SHA-256
+                let a2 = await sendFrame(stream, buildSASLInitial("SCRAM-SHA-256", scram.clientFirstMessage()));
+            }
+            if (kind == 11) {           // AuthenticationSASLContinue — server-first-message
+                let serverFirst = c.take(f.payload.length - 4);
+                let a3 = await sendFrame(stream, buildSASLResponse(scram.clientFinalMessage(serverFirst)));
+            }
+            // kind == 12 (SASLFinal, server signature) / 0 (Ok): nothing more to send; the
+            // server proceeds to ParameterStatus/BackendKeyData/ReadyForQuery. MD5 (5) is
+            // unsupported (this wolfSSL build disables MD5).
+        }
+        if (f.ftype == 69) {            // 'E' ErrorResponse during startup
+            break;
+        }
+    }
+    return PgConnection(stream, reader);
+}
+
+pub struct PgDriver impl Driver {
+    pub async fn connect(self, dsn: string): Connection {
+        // connect is a synchronous trait method: it DRIVES the async connect + handshake to
+        // completion (a one-time setup cost, one drive). The resulting connection's query/exec
+        // are async and PARK — that is where the non-blocking benefit lands.
+        return await pgConnectAsync(dsn);
+    }
+}
+
+struct PgDsn {
+    pub host: string,
+    pub port: int,
+    pub user: string,
+    pub password: string,
+    pub database: string,
+    init(host: string, port: int, user: string, password: string, database: string) {
+        self.host = host; self.port = port; self.user = user;
+        self.password = password; self.database = database;
+    }
+}
+
+// postgresql://user[:password]@host[:port]/database   (scheme optional; sane defaults)
+fn parseDsn(dsn: string): PgDsn {
+    let s = dsn;
+    let scheme = string.indexOf(s, "://");
+    if (scheme != -1) { s = string.slice(s, scheme + 3, s.length); }
+
+    let user = "postgres";
+    let password = "";
+    let at = string.lastIndexOf(s, "@");
+    if (at != -1) {
+        let cred = string.slice(s, 0, at);
+        s = string.slice(s, at + 1, s.length);
+        let colon = string.indexOf(cred, ":");
+        if (colon == -1) {
+            user = cred;
+        } else {
+            user = string.slice(cred, 0, colon);
+            password = string.slice(cred, colon + 1, cred.length);
+        }
+    }
+
+    let database = user;
+    let slash = string.indexOf(s, "/");
+    if (slash != -1) {
+        database = string.slice(s, slash + 1, s.length);
+        s = string.slice(s, 0, slash);
+    }
+
+    let host = s;
+    let port = 5432;
+    let pc = string.lastIndexOf(s, ":");
+    if (pc != -1) {
+        host = string.slice(s, 0, pc);
+        port = string.parseI64(string.slice(s, pc + 1, s.length));
+    }
+    return PgDsn(host, port, user, password, database);
+}

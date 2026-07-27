@@ -1,0 +1,7 @@
+__nova_test
+__nova_test.ll
+*.o
+*.ll
+merged.nova
+build/
+.nova/
