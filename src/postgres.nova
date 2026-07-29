@@ -22,7 +22,8 @@ import string;
 import list;
 import db;
 import crypto.scram;
-// The SCRAM client nonce is drawn straight from the CSPRNG runtime builtin (`nova_random_hex`,
+import crypto.random;
+// The SCRAM client nonce is drawn from the pure-Nova CSPRNG (crypto/random over /dev/urandom,
 // the same primitive crypto.random wraps) rather than importing the crypto.random MODULE — that
 // keeps its unrelated @test suite out of every program that imports this widely-used driver.
 
@@ -549,7 +550,7 @@ async fn pgConnectAsync(dsn: string): PgConnection {
 
     // D6: a SCRAM-SHA-256 exchange spans several 'R' messages, so the ScramClient (holding
     // username/password/client-nonce) lives across the loop. Nonce = 36 hex chars (CSPRNG).
-    let scram = ScramClient{ username: d.user, password: d.password, clientNonce: nova_random_hex(18) };
+    let scram = ScramClient{ username: d.user, password: d.password, clientNonce: random.randomHex(18) };
 
     while (true) {
         let f = await readFrame(reader);
