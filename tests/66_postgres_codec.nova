@@ -161,3 +161,18 @@ fn test_timestamp_and_bytea_decode(): void {
     // decodeByteaHex directly.
     assert.equalStr(postgres.decodeByteaHex("\\x4869"), "Hi");
 }
+
+@test
+fn test_multidigit_param_and_blob(): void {
+    // T4: $10/$11/$12 must substitute the 10th/11th/12th params (single-digit-only broke the ORM's
+    // $1..$N for >9 columns). And a blob param renders a binary-safe bytea literal, not text-escaped.
+    let p = List<DbValue>();
+    let i = 0;
+    while (i < 12) { p.push(db.dbInt(i + 1)); i = i + 1; }   // params 1..12 hold values 1..12
+    let sql = postgres.substituteParams("VALUES ($1, $10, $11, $12)", p);
+    assert.equalStr(sql, "VALUES (1, 10, 11, 12)");
+
+    let pb = List<DbValue>();
+    pb.push(db.dbBlob("Hi"));                                // "Hi" = 0x48 0x69
+    assert.equalStr(postgres.substituteParams("$1", pb), "'\\x4869'");
+}

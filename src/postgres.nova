@@ -546,10 +546,31 @@ fn escapeText(s: string): string {
     }
     return out + "'";
 }
+// bytea literal: '\xDEADBEEF'. Binary-safe (handles NUL/quotes), unlike text-escaping raw bytes.
+fn byteaLiteral(s: string): string {
+    let out = "'\\x";
+    let i = 0;
+    while (i < s.length) {
+        let b = s[i];
+        out = out + hexPair(b);
+        i = i + 1;
+    }
+    return out + "'";
+}
+fn hexPair(b: int): string {
+    let hi = (b / 16) & 15;
+    let lo = b & 15;
+    return hexDigit(hi) + hexDigit(lo);
+}
+fn hexDigit(v: int): string {
+    if (v < 10) { return string.slice("0123456789", v, v + 1); }
+    return string.slice("abcdef", v - 10, v - 10 + 1);
+}
 fn valueToSql(v: DbValue): string {
     if (v.isNull()) { return "NULL"; }
     if (v.kind == DbType.Bool) { if (v.asBool()) { return "true"; } return "false"; }
-    if (v.kind == DbType.Text || v.kind == DbType.Blob) { return escapeText(v.asText()); }
+    if (v.kind == DbType.Blob) { return byteaLiteral(v.asText()); }
+    if (v.kind == DbType.Text) { return escapeText(v.asText()); }
     if (v.kind == DbType.Decimal) { return v.asText(); }
     if (v.kind == DbType.Float4 || v.kind == DbType.Float8) { let d = v.asDouble(); return `${d}`; }
     let iv = v.asLong();
@@ -560,16 +581,15 @@ pub fn substituteParams(sql: string, params: List<DbValue>): string {
     let i = 0;
     let n = sql.length;
     while (i < n) {
-        if (sql[i] == 36 && i + 1 < n) {   // '$'
-            let d = sql[i + 1];
-            if (d >= 49 && d <= 57) {      // $1..$9
-                let p = params.get(d - 49) ?? db.dbNull();
-                out = out + valueToSql(p);
-                i = i + 2;
-            } else {
-                out = out + "$";
-                i = i + 1;
-            }
+        // '$' followed by one or more digits -> parameter N (1-based). Multi-digit ($10, $123, ...) is
+        // required: the ORM emits $1..$N for a struct's columns, so >9 columns were silently broken.
+        if (sql[i] == 36 && i + 1 < n && sql[i + 1] >= 48 && sql[i + 1] <= 57) {
+            let j = i + 1;
+            let num = 0;
+            while (j < n && sql[j] >= 48 && sql[j] <= 57) { num = num * 10 + (sql[j] - 48); j = j + 1; }
+            let p = params.get(num - 1) ?? db.dbNull();
+            out = out + valueToSql(p);
+            i = j;
         } else {
             out = out + string.slice(sql, i, i + 1);
             i = i + 1;
