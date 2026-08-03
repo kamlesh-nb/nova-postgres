@@ -105,6 +105,23 @@ fn test_tag_and_error_decode(): void {
     let err = postgres.decodeError(ep);
     assert.equalStr(err.code, "42P01");
     assert.equalStr(err.message, "no such table");
+
+    // T1: a decoded ErrorResponse now rides on the result via the seam (previously swallowed). This is
+    // exactly what query/exec set when they see an 'E' frame; the live path is otherwise unchanged.
+    let rs = db.errorResult(err);
+    assert.isTrue(rs.hasError());
+    assert.isTrue(!rs.ok());
+    assert.equalStr(rs.err.code, "42P01");
+    assert.equalStr(rs.err.message, "no such table");
+
+    let xr = db.errorExec(err);
+    assert.isTrue(xr.hasError());
+    assert.equalStr(xr.err.message, "no such table");
+
+    // A normal (successful) result carries noError() and reports ok().
+    let good = db.ResultSet();
+    assert.isTrue(good.ok());
+    assert.isTrue(!good.hasError());
 }
 fn byte83(): string { let p = bytes.alloc(1); bytes.write_byte(p, 0, 83); return p as string; }
 fn byteC(): string { let p = bytes.alloc(1); bytes.write_byte(p, 0, 67); return p as string; }

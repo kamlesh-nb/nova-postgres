@@ -394,6 +394,7 @@ pub struct PgConnection impl Connection {
                 rs.tag = decodeTag(f.payload);
                 rs.rows_affected = tagCount(rs.tag);
             }
+            if (f.ftype == 69) { rs.err = decodeError(f.payload); }          // 'E' ErrorResponse
         }
         return rs;
     }
@@ -401,12 +402,15 @@ pub struct PgConnection impl Connection {
     pub async fn exec(self, sql: string, params: List<DbValue>): ExecResult {
         let sn = await sendFrame(self.io, buildQuery(substituteParams(sql, params)));
         let tag = "";
+        let err = noError();
         while (true) {
             let f = await readFrame(self.reader);
             if (f.ftype == -1) { break; }
             if (f.ftype == 90) { break; }
             if (f.ftype == 67) { tag = decodeTag(f.payload); }
+            if (f.ftype == 69) { err = decodeError(f.payload); }             // 'E' ErrorResponse
         }
+        if (!err.isEmpty()) { return errorExec(err); }
         return ExecResult(tagCount(tag), tag);
     }
 
@@ -444,7 +448,8 @@ pub struct PgConnection impl Connection {
             if (f.ftype == -1) { break; }
             if (f.ftype == 90) { break; }                          // 'Z' ReadyForQuery
             if (f.ftype == 84) { cols = decodeRowDesc(f.payload); } // 'T' RowDescription
-            if (f.ftype == 69) { break; }                          // 'E' ErrorResponse
+            // 'E' ErrorResponse: keep draining to 'Z' so the stream stays in sync (prepare returns an
+            // int handle and has no error channel yet; query/exec surface the DbError).
             // '1' ParseComplete / 't' ParameterDescription / 'n' NoData — nothing to capture.
         }
         self.stmts.push(PgStmt(name, sql, cols));
@@ -468,7 +473,7 @@ pub struct PgConnection impl Connection {
                 rs.tag = decodeTag(f.payload);
                 rs.rows_affected = tagCount(rs.tag);
             }
-            if (f.ftype == 69) { break; }                                            // 'E'
+            if (f.ftype == 69) { rs.err = decodeError(f.payload); }                   // 'E' -- drain to 'Z'
             // '2' BindComplete — nothing to do.
         }
         return rs;
@@ -481,13 +486,15 @@ pub struct PgConnection impl Connection {
         let s2 = await sendFrame(self.io, buildExecute("", 0));
         let s3 = await sendFrame(self.io, buildSync());
         let tag = "";
+        let err = noError();
         while (true) {
             let f = await readFrame(self.reader);
             if (f.ftype == -1) { break; }
             if (f.ftype == 90) { break; }               // 'Z'
             if (f.ftype == 67) { tag = decodeTag(f.payload); }
-            if (f.ftype == 69) { break; }               // 'E'
+            if (f.ftype == 69) { err = decodeError(f.payload); }   // 'E' -- drain to 'Z'
         }
+        if (!err.isEmpty()) { return errorExec(err); }
         return ExecResult(tagCount(tag), tag);
     }
 }
