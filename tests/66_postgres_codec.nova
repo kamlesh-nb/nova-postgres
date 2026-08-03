@@ -176,3 +176,15 @@ fn test_multidigit_param_and_blob(): void {
     pb.push(db.dbBlob("Hi"));                                // "Hi" = 0x48 0x69
     assert.equalStr(postgres.substituteParams("$1", pb), "'\\x4869'");
 }
+
+@test
+fn test_cancel_request_frame(): void {
+    // T8: CancelRequest = [len i32=16][magic 80877102][pid][secret], no type byte.
+    // magic 80877102 = 0x04D2162E; pid=7 secret=99.
+    let f = postgres.buildCancelRequest(7, 99);
+    assert.equalInt(f.length, 16);
+    assert.equalInt(f[3], 16);              // length
+    assert.equalInt(f[4], 4); assert.equalInt(f[5], 210); assert.equalInt(f[6], 22); assert.equalInt(f[7], 46);  // magic
+    assert.equalInt(f[11], 7);              // pid (i32 BE low byte)
+    assert.equalInt(f[15], 99);             // secret
+}

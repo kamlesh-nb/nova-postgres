@@ -78,6 +78,12 @@ pub fn buildStartup(user: string, database: string): string {
 // 'S' (83, TLS supported) or 'N' (78, refused), then (on 'S') the TLS handshake runs on this socket.
 pub fn buildSSLRequest(): string { return i32be(8) + i32be(80877103); }
 
+// CancelRequest: NO type byte, [len i32 = 16][magic 80877102][pid i32][secret i32]. Sent on a fresh
+// connection to ask the server to cancel the query in progress on the session identified by (pid, secret).
+pub fn buildCancelRequest(pid: int, secret: int): string {
+    return i32be(16) + i32be(80877102) + i32be(pid) + i32be(secret);
+}
+
 pub fn buildQuery(sql: string): string { return typedFrame(81, cstr(sql)); }  // 'Q'
 pub fn buildPassword(pw: string): string { return typedFrame(112, cstr(pw)); } // 'p'
 pub fn buildTerminate(): string { return typedFrame(88, ""); }                 // 'X'
@@ -410,10 +416,18 @@ pub struct PgConnection impl Connection {
     pub io: aio.AsyncIO,
     pub reader: PgReader,
     pub stmts: List<PgStmt>,     // D6: per-connection prepared-statement cache
-    init(io: aio.AsyncIO, reader: PgReader) {
+    pub host: string,            // for CancelRequest (opens a SIDE connection to the same server)
+    pub port: int,
+    pub pid: int,                // BackendKeyData: process id + secret, needed to cancel this session
+    pub secret: int,
+    init(io: aio.AsyncIO, reader: PgReader, host: string, port: int, pid: int, secret: int) {
         self.io = io;
         self.reader = reader;
         self.stmts = List<PgStmt>();
+        self.host = host;
+        self.port = port;
+        self.pid = pid;
+        self.secret = secret;
     }
 
     pub async fn query(self, sql: string, params: List<DbValue>): ResultSet {
@@ -537,6 +551,16 @@ pub struct PgConnection impl Connection {
     pub async fn begin(self): ExecResult { return await self.exec("BEGIN", List<DbValue>()); }
     pub async fn commit(self): ExecResult { return await self.exec("COMMIT", List<DbValue>()); }
     pub async fn rollback(self): ExecResult { return await self.exec("ROLLBACK", List<DbValue>()); }
+
+    // Cancel the query currently running on THIS session. Postgres requires this on a fresh connection
+    // (the running connection is busy), authenticated only by the (pid, secret) captured at handshake.
+    // Call from a different coroutine while a query on this connection is in flight (e.g. on a deadline).
+    pub async fn cancel(self): void {
+        if (self.pid == 0) { return; }        // no BackendKeyData -> cannot cancel
+        let side = await aio.asyncConnect(self.host, self.port);
+        let _ = await side.sendStr(buildCancelRequest(self.pid, self.secret));
+        side.close();
+    }
 }
 
 // Client-side $1..$N substitution with SQL-standard escaping (text single-quoted with
@@ -649,10 +673,17 @@ async fn pgStartup(io: aio.AsyncIO, d: PgDsn): PgConnection {
     // username/password/client-nonce) lives across the loop. Nonce = 36 hex chars (CSPRNG).
     let scram = ScramClient{ username: d.user, password: d.password, clientNonce: random.randomHex(18) };
 
+    let pid = 0;
+    let secret = 0;
     while (true) {
         let f = await readFrame(reader);
         if (f.ftype == -1) { break; }
         if (f.ftype == 90) { break; }   // 'Z' ReadyForQuery — handshake done
+        if (f.ftype == 75) {            // 'K' BackendKeyData: capture pid + secret for CancelRequest
+            let kc = PgCursor(f.payload);
+            pid = kc.i32();
+            secret = kc.i32();
+        }
         if (f.ftype == 82) {            // 'R' Authentication
             let c = PgCursor(f.payload);
             let kind = c.i32();
@@ -672,7 +703,7 @@ async fn pgStartup(io: aio.AsyncIO, d: PgDsn): PgConnection {
             break;
         }
     }
-    return PgConnection(io, reader);
+    return PgConnection(io, reader, d.host, d.port, pid, secret);
 }
 
 pub struct PgDriver impl Driver {
