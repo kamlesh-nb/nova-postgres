@@ -16,7 +16,7 @@
 //
 // The wire CODEC (frame build + response decode) is pure over byte buffers, gated offline;
 // connect/query wire it to a TcpStream and are live-verified against a running PostgreSQL.
-import net.asyncio;
+import net.aio;
 import bytes;
 import string;
 import list;
@@ -286,12 +286,12 @@ fn tagCount(tag: string): int {
 // which PARKS the coroutine (asio arecv) instead of blocking the scheduler thread. `io` is an
 // AsyncStream; a TLS variant (TlsStream) drops in unchanged via the shared recvInto shape.
 struct PgReader {
-    pub io: asyncio.AsyncStream,
+    pub io: aio.AsyncStream,
     pub buf: ptr,
     pub cap: int,
     pub len: int,
     pub pos: int,
-    init(io: asyncio.AsyncStream) {
+    init(io: aio.AsyncStream) {
         self.io = io;
         self.cap = 65536;
         self.buf = bytes.alloc(65536);
@@ -352,7 +352,7 @@ async fn readFrame(r: PgReader): PgFrame {
     return PgFrame(t, out as string);
 }
 
-async fn sendFrame(io: asyncio.AsyncStream, frame: string): int {
+async fn sendFrame(io: aio.AsyncStream, frame: string): int {
     return await io.sendStr(frame);
 }
 
@@ -372,10 +372,10 @@ struct PgStmt {
 // --- The seam implementation --------------------------------------------------
 
 pub struct PgConnection impl Connection {
-    pub io: asyncio.AsyncStream,
+    pub io: aio.AsyncStream,
     pub reader: PgReader,
     pub stmts: List<PgStmt>,     // D6: per-connection prepared-statement cache
-    init(io: asyncio.AsyncStream, reader: PgReader) {
+    init(io: aio.AsyncStream, reader: PgReader) {
         self.io = io;
         self.reader = reader;
         self.stmts = List<PgStmt>();
@@ -544,7 +544,7 @@ pub fn substituteParams(sql: string, params: List<DbValue>): string {
 // asio io_context through the entire handshake.
 async fn pgConnectAsync(dsn: string): PgConnection {
     let d = parseDsn(dsn);
-    let stream = await asyncio.asyncConnect(d.host, d.port);
+    let stream = await aio.asyncConnect(d.host, d.port);
     let reader = PgReader(stream);
     let sn = await sendFrame(stream, buildStartup(d.user, d.database));
 
