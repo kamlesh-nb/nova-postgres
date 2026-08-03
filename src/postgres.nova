@@ -420,6 +420,7 @@ pub struct PgConnection impl Connection {
     pub port: int,
     pub pid: int,                // BackendKeyData: process id + secret, needed to cancel this session
     pub secret: int,
+    pub busy: bool,              // concurrency guard: one in-flight request per connection
     init(io: aio.AsyncIO, reader: PgReader, host: string, port: int, pid: int, secret: int) {
         self.io = io;
         self.reader = reader;
@@ -428,9 +429,14 @@ pub struct PgConnection impl Connection {
         self.port = port;
         self.pid = pid;
         self.secret = secret;
+        self.busy = false;
     }
 
     pub async fn query(self, sql: string, params: List<DbValue>): ResultSet {
+        // A connection is a single request/response channel; a second concurrent query would interleave
+        // frames and corrupt the stream. Refuse re-entry instead (use a pool for concurrency).
+        if (self.busy) { return db.errorResult(db.DbError("", "connection busy: concurrent use")); }
+        self.busy = true;
         let sn = await sendFrame(self.io, buildQuery(substituteParams(sql, params)));
         let rs = ResultSet();
         while (true) {
@@ -445,10 +451,13 @@ pub struct PgConnection impl Connection {
             }
             if (f.ftype == 69) { rs.err = decodeError(f.payload); }          // 'E' ErrorResponse
         }
+        self.busy = false;
         return rs;
     }
 
     pub async fn exec(self, sql: string, params: List<DbValue>): ExecResult {
+        if (self.busy) { return errorExec(db.DbError("", "connection busy: concurrent use")); }
+        self.busy = true;
         let sn = await sendFrame(self.io, buildQuery(substituteParams(sql, params)));
         let tag = "";
         let err = noError();
@@ -459,6 +468,7 @@ pub struct PgConnection impl Connection {
             if (f.ftype == 67) { tag = decodeTag(f.payload); }
             if (f.ftype == 69) { err = decodeError(f.payload); }             // 'E' ErrorResponse
         }
+        self.busy = false;
         if (!err.isEmpty()) { return errorExec(err); }
         return ExecResult(tagCount(tag), tag);
     }
