@@ -144,3 +144,20 @@ fn test_ssl_request_frame(): void {
     assert.equalInt(f[0], 0); assert.equalInt(f[1], 0); assert.equalInt(f[2], 0); assert.equalInt(f[3], 8);
     assert.equalInt(f[4], 4); assert.equalInt(f[5], 210); assert.equalInt(f[6], 22); assert.equalInt(f[7], 47);
 }
+
+@test
+fn test_timestamp_and_bytea_decode(): void {
+    // T3: a timestamp column keeps its ISO text (not parseI64'd to the year), and bytea "\xHEX" decodes
+    // to the raw bytes. OIDs: timestamp=1114, bytea=17.
+    let rd = i16b(2) + field("ts", 1114) + field("data", 17);
+    let cols = postgres.decodeRowDesc(rd);
+    let ts = "2024-01-01 12:00:00+00";
+    let bytea = "\\x48656c6c6f";                       // hex for "Hello"
+    let dr = i16b(2) + i32b(ts.length) + ts + i32b(bytea.length) + bytea;
+    let row = postgres.decodeDataRow(dr, cols);
+    assert.equalStr(row.getTimestamp(0), "2024-01-01 12:00:00+00");
+    assert.equalStr(row.getText(1), "Hello");
+
+    // decodeByteaHex directly.
+    assert.equalStr(postgres.decodeByteaHex("\\x4869"), "Hi");
+}
