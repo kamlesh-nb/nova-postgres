@@ -532,6 +532,11 @@ pub struct PgConnection impl Connection {
         if (!err.isEmpty()) { return errorExec(err); }
         return ExecResult(tagCount(tag), tag);
     }
+
+    // Transaction control (standard SQL). exec already surfaces a DbError via .err on failure.
+    pub async fn begin(self): ExecResult { return await self.exec("BEGIN", List<DbValue>()); }
+    pub async fn commit(self): ExecResult { return await self.exec("COMMIT", List<DbValue>()); }
+    pub async fn rollback(self): ExecResult { return await self.exec("ROLLBACK", List<DbValue>()); }
 }
 
 // Client-side $1..$N substitution with SQL-standard escaping (text single-quoted with
