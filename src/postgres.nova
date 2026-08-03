@@ -319,6 +319,53 @@ pub fn decodeError(payload: string): DbError {
     return DbError(code, msg);
 }
 
+// --- T14: LISTEN/NOTIFY — NotificationResponse ('A') --------------------------
+// An asynchronous NOTIFY delivered by the server on a session that has issued LISTEN.
+pub struct PgNotification {
+    pub pid: int,        // process id of the notifying backend
+    pub channel: string, // the channel name (matches the LISTEN target)
+    pub payload: string, // optional payload text ("" if NOTIFY sent none)
+    init(pid: int, channel: string, payload: string) {
+        self.pid = pid;
+        self.channel = channel;
+        self.payload = payload;
+    }
+}
+
+/// NotificationResponse ('A'): int32 process-id, then a NUL-terminated channel name,
+/// then a NUL-terminated payload string. Pure — the offline gate calls this directly.
+pub fn decodeNotification(payload: string): PgNotification {
+    let c = PgCursor(payload);
+    let pid = c.i32();
+    let channel = c.cstr();
+    let text = c.cstr();
+    return PgNotification(pid, channel, text);
+}
+
+// --- T14: COPY sub-protocol (decode side) -------------------------------------
+// The header carried by CopyOutResponse ('H') / CopyInResponse ('G').
+pub struct PgCopyInfo {
+    pub format: int,   // overall copy format: 0 = textual, 1 = binary
+    pub columns: int,  // number of columns in the copy stream
+    init(format: int, columns: int) {
+        self.format = format;
+        self.columns = columns;
+    }
+}
+
+/// CopyOutResponse ('H') / CopyInResponse ('G') header: int8 overall format,
+/// int16 numColumns, then int16[numColumns] per-column formats (ignored here).
+pub fn decodeCopyResponse(payload: string): PgCopyInfo {
+    let c = PgCursor(payload);
+    let format = c.byte();
+    let columns = c.i16();
+    return PgCopyInfo(format, columns);
+}
+
+/// CopyData ('d') carries one raw row chunk — the whole payload IS the data. 'c' CopyDone
+/// is empty and needs no decoder. This extractor returns the chunk bytes verbatim.
+pub fn decodeCopyData(payload: string): string { return payload; }
+
 // "SELECT 2" / "INSERT 0 1" / "UPDATE 3" -> the trailing count.
 fn tagCount(tag: string): int {
     let sp = string.lastIndexOf(tag, " ");
@@ -426,6 +473,7 @@ pub struct PgConnection impl Connection {
     pub pid: int,                // BackendKeyData: process id + secret, needed to cancel this session
     pub secret: int,
     pub busy: bool,              // concurrency guard: one in-flight request per connection
+    pub notes: List<PgNotification>,  // T14: async NOTIFYs captured off the wire during query/exec
     init(io: aio.AsyncIO, reader: PgReader, host: string, port: int, pid: int, secret: int) {
         self.io = io;
         self.reader = reader;
@@ -435,6 +483,7 @@ pub struct PgConnection impl Connection {
         self.pid = pid;
         self.secret = secret;
         self.busy = false;
+        self.notes = List<PgNotification>();
     }
 
     pub async fn query(self, sql: string, params: List<DbValue>): ResultSet {
@@ -455,6 +504,7 @@ pub struct PgConnection impl Connection {
                 rs.rows_affected = tagCount(rs.tag);
             }
             if (f.ftype == 69) { rs.err = decodeError(f.payload); }          // 'E' ErrorResponse
+            if (f.ftype == 65) { self.notes.push(decodeNotification(f.payload)); } // 'A' NotificationResponse
         }
         self.busy = false;
         return rs;
@@ -472,6 +522,7 @@ pub struct PgConnection impl Connection {
             if (f.ftype == 90) { break; }
             if (f.ftype == 67) { tag = decodeTag(f.payload); }
             if (f.ftype == 69) { err = decodeError(f.payload); }             // 'E' ErrorResponse
+            if (f.ftype == 65) { self.notes.push(decodeNotification(f.payload)); } // 'A' NotificationResponse
         }
         self.busy = false;
         if (!err.isEmpty()) { return errorExec(err); }
@@ -566,6 +617,43 @@ pub struct PgConnection impl Connection {
     pub async fn begin(self): ExecResult { return await self.exec("BEGIN", List<DbValue>()); }
     pub async fn commit(self): ExecResult { return await self.exec("COMMIT", List<DbValue>()); }
     pub async fn rollback(self): ExecResult { return await self.exec("ROLLBACK", List<DbValue>()); }
+
+    // --- T14: LISTEN/NOTIFY ---------------------------------------------------
+    // Register interest in a channel. Runs `LISTEN <channel>` via the normal exec path (the
+    // server replies CommandComplete); subsequent NOTIFYs arrive as async 'A' frames, which the
+    // query/exec read loops capture into `self.notes`. Drain them with `notifications()`.
+    pub async fn listen(self, channel: string): ExecResult {
+        return await self.exec("LISTEN " + channel, List<DbValue>());
+    }
+    // Drain the notifications buffered off the wire so far (captured during any query/exec on this
+    // connection) and reset the buffer. NOTE: this returns what has ALREADY been read; a dedicated
+    // idle delivery loop that blocks awaiting the next 'A' with no query in flight is the follow-on.
+    pub fn notifications(self): List<PgNotification> {
+        let out = self.notes;
+        self.notes = List<PgNotification>();
+        return out;
+    }
+
+    // --- T14: COPY OUT --------------------------------------------------------
+    // Run `COPY ... TO STDOUT` and collect each 'd' CopyData chunk as a string until 'c' CopyDone,
+    // then drain 'C' CommandComplete / 'Z' ReadyForQuery. The offline gate exercises the pure
+    // decoders (decodeCopyResponse / decodeCopyData); this wires them to the live stream.
+    pub async fn copyOut(self, sql: string): List<string> {
+        let chunks = List<string>();
+        if (self.busy) { return chunks; }
+        self.busy = true;
+        let sn = await sendFrame(self.io, buildQuery(sql));
+        while (true) {
+            let f = await readFrame(self.reader);
+            if (f.ftype == -1) { break; }
+            if (f.ftype == 90) { break; }                              // 'Z' ReadyForQuery
+            if (f.ftype == 100) { chunks.push(decodeCopyData(f.payload)); } // 'd' CopyData
+            // 'H'(72) CopyOutResponse header, 'c'(99) CopyDone, 'C'(67) CommandComplete — nothing to collect.
+            if (f.ftype == 65) { self.notes.push(decodeNotification(f.payload)); } // 'A'
+        }
+        self.busy = false;
+        return chunks;
+    }
 
     // Cancel the query currently running on THIS session. Postgres requires this on a fresh connection
     // (the running connection is busy), authenticated only by the (pid, secret) captured at handshake.
