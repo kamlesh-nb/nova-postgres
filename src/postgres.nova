@@ -17,6 +17,8 @@
 // The wire CODEC (frame build + response decode) is pure over byte buffers, gated offline;
 // connect/query wire it to a TcpStream and are live-verified against a running PostgreSQL.
 import net.aio;
+import net.asynctls;
+import io.file;
 import bytes;
 import string;
 import list;
@@ -72,6 +74,10 @@ pub fn buildStartup(user: string, database: string): string {
     let body = i32be(196608) + params;   // protocol 3.0 = 0x00030000
     return i32be(4 + body.length) + body;
 }
+// SSLRequest: NO type byte, [len i32 = 8][magic 80877103]. The server replies with a single byte
+// 'S' (83, TLS supported) or 'N' (78, refused), then (on 'S') the TLS handshake runs on this socket.
+pub fn buildSSLRequest(): string { return i32be(8) + i32be(80877103); }
+
 pub fn buildQuery(sql: string): string { return typedFrame(81, cstr(sql)); }  // 'Q'
 pub fn buildPassword(pw: string): string { return typedFrame(112, cstr(pw)); } // 'p'
 pub fn buildTerminate(): string { return typedFrame(88, ""); }                 // 'X'
@@ -286,12 +292,12 @@ fn tagCount(tag: string): int {
 // which PARKS the coroutine (asio arecv) instead of blocking the scheduler thread. `io` is an
 // AsyncStream; a TLS variant (TlsStream) drops in unchanged via the shared recvInto shape.
 struct PgReader {
-    pub io: aio.AsyncStream,
+    pub io: aio.AsyncIO,
     pub buf: ptr,
     pub cap: int,
     pub len: int,
     pub pos: int,
-    init(io: aio.AsyncStream) {
+    init(io: aio.AsyncIO) {
         self.io = io;
         self.cap = 65536;
         self.buf = bytes.alloc(65536);
@@ -352,7 +358,7 @@ async fn readFrame(r: PgReader): PgFrame {
     return PgFrame(t, out as string);
 }
 
-async fn sendFrame(io: aio.AsyncStream, frame: string): int {
+async fn sendFrame(io: aio.AsyncIO, frame: string): int {
     return await io.sendStr(frame);
 }
 
@@ -372,10 +378,10 @@ struct PgStmt {
 // --- The seam implementation --------------------------------------------------
 
 pub struct PgConnection impl Connection {
-    pub io: aio.AsyncStream,
+    pub io: aio.AsyncIO,
     pub reader: PgReader,
     pub stmts: List<PgStmt>,     // D6: per-connection prepared-statement cache
-    init(io: aio.AsyncStream, reader: PgReader) {
+    init(io: aio.AsyncIO, reader: PgReader) {
         self.io = io;
         self.reader = reader;
         self.stmts = List<PgStmt>();
@@ -551,9 +557,39 @@ pub fn substituteParams(sql: string, params: List<DbValue>): string {
 // asio io_context through the entire handshake.
 async fn pgConnectAsync(dsn: string): PgConnection {
     let d = parseDsn(dsn);
-    let stream = await aio.asyncConnect(d.host, d.port);
-    let reader = PgReader(stream);
-    let sn = await sendFrame(stream, buildStartup(d.user, d.database));
+    let base = await aio.asyncConnect(d.host, d.port);
+
+    // sslmode=disable (default): plaintext, unchanged path.
+    if (string.eql(d.sslmode, "disable")) {
+        return await pgStartup(base, d);
+    }
+
+    // STARTTLS: send SSLRequest and read the single-byte reply ('S' supported / 'N' refused).
+    let _sr = await base.sendStr(buildSSLRequest());
+    let rb = bytes.alloc(1);
+    let rn = await base.recvInto(rb as long, 1);
+    let sslByte = if (rn > 0) bytes.read_byte(rb, 0) else 0;
+    bytes.free(rb);
+
+    if (sslByte == 83) {   // 'S' — upgrade this socket to TLS
+        if (string.eql(d.sslmode, "verify-full")) {
+            let caPem = if (d.sslrootcert != "") File.readText(d.sslrootcert) else "";
+            let ts = await asynctls.tlsClientUpgradeVerify(base, d.host, caPem);
+            return await pgStartup(ts, d);
+        }
+        let ts2 = await asynctls.tlsClientUpgrade(base, d.host);
+        return await pgStartup(ts2, d);
+    }
+    // 'N': server refused TLS. Best-effort fallback to plaintext for now; fail-closed enforcement
+    // (require/verify-full MUST NOT continue unencrypted) needs the connect error channel (T1 residual).
+    return await pgStartup(base, d);
+}
+
+// Run the Postgres startup + auth handshake over `io` (plaintext AsyncStream or an upgraded TlsStream,
+// both AsyncIO). Passing the concrete stream into this AsyncIO param is a widening, the safe direction.
+async fn pgStartup(io: aio.AsyncIO, d: PgDsn): PgConnection {
+    let reader = PgReader(io);
+    let sn = await sendFrame(io, buildStartup(d.user, d.database));
 
     // D6: a SCRAM-SHA-256 exchange spans several 'R' messages, so the ScramClient (holding
     // username/password/client-nonce) lives across the loop. Nonce = 36 hex chars (CSPRNG).
@@ -567,24 +603,22 @@ async fn pgConnectAsync(dsn: string): PgConnection {
             let c = PgCursor(f.payload);
             let kind = c.i32();
             if (kind == 3) {            // cleartext password
-                let a1 = await sendFrame(stream, buildPassword(d.password));
+                let a1 = await sendFrame(io, buildPassword(d.password));
             }
             if (kind == 10) {           // AuthenticationSASL — offer SCRAM-SHA-256
-                let a2 = await sendFrame(stream, buildSASLInitial("SCRAM-SHA-256", scram.clientFirstMessage()));
+                let a2 = await sendFrame(io, buildSASLInitial("SCRAM-SHA-256", scram.clientFirstMessage()));
             }
             if (kind == 11) {           // AuthenticationSASLContinue — server-first-message
                 let serverFirst = c.take(f.payload.length - 4);
-                let a3 = await sendFrame(stream, buildSASLResponse(scram.clientFinalMessage(serverFirst)));
+                let a3 = await sendFrame(io, buildSASLResponse(scram.clientFinalMessage(serverFirst)));
             }
-            // kind == 12 (SASLFinal, server signature) / 0 (Ok): nothing more to send; the
-            // server proceeds to ParameterStatus/BackendKeyData/ReadyForQuery. MD5 (5) is
-            // unsupported (this wolfSSL build disables MD5).
+            // kind == 12 (SASLFinal) / 0 (Ok): nothing more to send. MD5 (5) is unsupported.
         }
         if (f.ftype == 69) {            // 'E' ErrorResponse during startup
             break;
         }
     }
-    return PgConnection(stream, reader);
+    return PgConnection(io, reader);
 }
 
 pub struct PgDriver impl Driver {
@@ -602,17 +636,38 @@ struct PgDsn {
     pub user: string,
     pub password: string,
     pub database: string,
-    init(host: string, port: int, user: string, password: string, database: string) {
+    pub sslmode: string,       // "disable" (default) | "require" | "verify-full"
+    pub sslrootcert: string,   // path to a PEM CA bundle (verify-full)
+    init(host: string, port: int, user: string, password: string, database: string, sslmode: string, sslrootcert: string) {
         self.host = host; self.port = port; self.user = user;
         self.password = password; self.database = database;
+        self.sslmode = sslmode; self.sslrootcert = sslrootcert;
     }
+}
+
+// Pull `key=value` out of a `?a=b&c=d` DSN query string (returns `dflt` if absent).
+fn dsnParam(dsn: string, key: string, dflt: string): string {
+    let needle = key + "=";
+    let idx = string.indexOf(dsn, needle);
+    if (idx == -1) { return dflt; }
+    let start = idx + needle.length;
+    let rest = string.slice(dsn, start, dsn.length);
+    let amp = string.indexOf(rest, "&");
+    if (amp == -1) { return rest; }
+    return string.slice(rest, 0, amp);
 }
 
 // postgresql://user[:password]@host[:port]/database   (scheme optional; sane defaults)
 fn parseDsn(dsn: string): PgDsn {
+    let sslmode = dsnParam(dsn, "sslmode", "disable");
+    let sslrootcert = dsnParam(dsn, "sslrootcert", "");
+
     let s = dsn;
     let scheme = string.indexOf(s, "://");
     if (scheme != -1) { s = string.slice(s, scheme + 3, s.length); }
+    // Drop the `?query` so it does not leak into the database/host parse.
+    let q = string.indexOf(s, "?");
+    if (q != -1) { s = string.slice(s, 0, q); }
 
     let user = "postgres";
     let password = "";
@@ -643,5 +698,5 @@ fn parseDsn(dsn: string): PgDsn {
         host = string.slice(s, 0, pc);
         port = string.parseI64(string.slice(s, pc + 1, s.length));
     }
-    return PgDsn(host, port, user, password, database);
+    return PgDsn(host, port, user, password, database, sslmode, sslrootcert);
 }

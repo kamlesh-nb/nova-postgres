@@ -135,3 +135,12 @@ fn test_param_substitution(): void {
     let sql = postgres.substituteParams("INSERT INTO t VALUES ($1, $2)", p);
     assert.equalStr(sql, "INSERT INTO t VALUES (7, 'o''brien')");
 }
+
+@test
+fn test_ssl_request_frame(): void {
+    // T2: SSLRequest is [len i32 = 8][magic 80877103 = 0x04D2162F], no type byte.
+    let f = postgres.buildSSLRequest();
+    assert.equalInt(f.length, 8);
+    assert.equalInt(f[0], 0); assert.equalInt(f[1], 0); assert.equalInt(f[2], 0); assert.equalInt(f[3], 8);
+    assert.equalInt(f[4], 4); assert.equalInt(f[5], 210); assert.equalInt(f[6], 22); assert.equalInt(f[7], 47);
+}
