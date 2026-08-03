@@ -41,7 +41,10 @@ fn oidToDbType(oid: int): DbType {
     if (oid == 1700) { return DbType.Decimal; }   // numeric
     if (oid == 1114) { return DbType.Timestamp; } // timestamp
     if (oid == 1184) { return DbType.Timestamp; } // timestamptz
-    if (oid == 17) { return DbType.Blob; }        // bytea
+    if (oid == 17) { return DbType.Blob; }         // bytea
+    if (oid == 2950) { return DbType.Uuid; }       // uuid
+    if (oid == 114) { return DbType.Json; }        // json
+    if (oid == 3802) { return DbType.Json; }       // jsonb
     // text(25) / varchar(1043) / bpchar(1042) / name(19) / anything else -> Text
     return DbType.Text;
 }
@@ -258,6 +261,8 @@ fn decodeCell(t: DbType, raw: string, isNull: bool): DbValue {
     // Temporal: pg text format is an ISO string (e.g. "2024-01-01 12:00:00+00"); keep it verbatim.
     // Forcing it through parseI64 (the old behaviour) yielded just the leading year -> garbage.
     if (t == DbType.Timestamp) { return db.dbTimestamp(raw); }
+    if (t == DbType.Uuid) { return db.dbUuid(raw); }
+    if (t == DbType.Json) { return db.dbJson(raw); }
     if (t == DbType.Float4 || t == DbType.Float8) { return db.dbDouble(string.parseFloat(raw)); }
     // bytea text format is "\xHEX..."; decode it to the raw bytes (a Blob). A non-\x value passes through.
     if (t == DbType.Blob) {
