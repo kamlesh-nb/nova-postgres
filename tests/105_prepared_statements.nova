@@ -8,14 +8,14 @@ import assert;
 import list;
 import string;
 import db;
-import postgres;
+import codec;
 
 // --- (1) PG extended-query frame shape ----------------------------------------
 
 @test
 fn test_parse_frame_shape(): void {
     // Parse ('P'=80): [80][len i32][name\0][sql\0][i16 0 param-types].
-    let f = postgres.buildParse("s0", "SELECT 1");
+    let f = codec.buildParse("s0", "SELECT 1");
     assert.equalInt(f[0], 80);
     // total length = 1 (type) + 4 (len) + "s0\0"(3) + "SELECT 1\0"(9) + 2 = 19
     assert.equalInt(f.length, 19);
@@ -30,7 +30,7 @@ fn test_bind_frame_shape(): void {
     let params = List<DbValue>();
     params.push(db.dbInt(5));
     params.push(db.dbText("hi"));
-    let f = postgres.buildBind("", "s0", params);
+    let f = codec.buildBind("", "s0", params);
     assert.equalInt(f[0], 66);
     // portal "\0" + stmt "s0\0" + i16(0 fmt) + i16(2 params)
     //   + [i32(1)+"5"] + [i32(2)+"hi"] + i16(0 result fmt)
@@ -40,15 +40,15 @@ fn test_bind_frame_shape(): void {
 
 @test
 fn test_sync_and_describe_and_execute(): void {
-    let s = postgres.buildSync();       // 'S'=83, empty payload -> len 4, total 5
+    let s = codec.buildSync();       // 'S'=83, empty payload -> len 4, total 5
     assert.equalInt(s[0], 83);
     assert.equalInt(s.length, 5);
 
-    let d = postgres.buildDescribeStmt("s0");   // 'D'=68, 'S'=83 + "s0\0"
+    let d = codec.buildDescribeStmt("s0");   // 'D'=68, 'S'=83 + "s0\0"
     assert.equalInt(d[0], 68);
     assert.equalInt(d[5], 83);           // first payload byte = 'S' (describe statement)
 
-    let e = postgres.buildExecute("", 0);   // 'E'=69
+    let e = codec.buildExecute("", 0);   // 'E'=69
     assert.equalInt(e[0], 69);
 }
 

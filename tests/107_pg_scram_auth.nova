@@ -5,7 +5,7 @@
 //      (client-first-message + client-final-message proof).
 import assert;
 import string;
-import postgres;
+import codec;
 import crypto.scram;
 
 // --- (1) SASL frame shape -----------------------------------------------------
@@ -14,7 +14,7 @@ import crypto.scram;
 fn test_sasl_initial_frame_shape(): void {
     // SASLInitialResponse ('p'=112): [112][len i32][mech cstr][i32 cf-len][cf bytes].
     let cf = "n,,n=user,r=abc";       // length 15
-    let f = postgres.buildSASLInitial("SCRAM-SHA-256", cf);
+    let f = codec.buildSASLInitial("SCRAM-SHA-256", cf);
     assert.equalInt(f[0], 112);
     // payload = "SCRAM-SHA-256\0"(14) + i32(4) + cf(15) = 33; frame = 1+4+33 = 38
     assert.equalInt(f.length, 38);
@@ -32,7 +32,7 @@ fn test_sasl_initial_frame_shape(): void {
 fn test_sasl_response_frame_shape(): void {
     // SASLResponse ('p'=112): [112][len i32][client-final bytes].
     let final = "c=biws,r=abcdef,p=proof==";   // length 25
-    let f = postgres.buildSASLResponse(final);
+    let f = codec.buildSASLResponse(final);
     assert.equalInt(f[0], 112);
     assert.equalInt(f.length, 30);              // 1 + 4 + 25
     let lenField = ((f[1] * 256 + f[2]) * 256 + f[3]) * 256 + f[4];
@@ -63,7 +63,7 @@ fn test_sasl_initial_wraps_client_first(): void {
     // End-to-end: the SASLInitial frame's payload tail is exactly the client-first-message.
     let c = ScramClient{ username: "user", password: "pencil", clientNonce: "rOprNGfwEbeRWgbNEkqO" };
     let cf = c.clientFirstMessage();
-    let f = postgres.buildSASLInitial("SCRAM-SHA-256", cf);
+    let f = codec.buildSASLInitial("SCRAM-SHA-256", cf);
     // tail (after 5 header bytes + 14 mech + 4 len = 23) == client-first
     assert.equalStr(string.slice(f, 23, f.length), cf);
 }

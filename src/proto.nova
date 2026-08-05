@@ -1,0 +1,80 @@
+// proto — the async transport framing (SRP: read/write whole protocol frames off a
+// live stream). Buffered reader over an AsyncIO; the socket I/O is non-blocking — `fill`
+// awaits `io.recvInto`, which PARKS the coroutine (asio arecv) instead of blocking the
+// scheduler thread. `io` is an AsyncStream; a TLS variant (TlsStream) drops in unchanged
+// via the shared recvInto shape. Knows framing bytes only — payload MEANING lives in
+// codec.
+import net.aio;
+import bytes;
+
+pub struct PgReader {
+    pub io: aio.AsyncIO,
+    pub buf: ptr,
+    pub cap: int,
+    pub len: int,
+    pub pos: int,
+    init(io: aio.AsyncIO) {
+        self.io = io;
+        self.cap = 65536;
+        self.buf = bytes.alloc(65536);
+        self.len = 0;
+        self.pos = 0;
+    }
+}
+async fn fill(r: PgReader): bool {
+    if (r.pos > 0) {
+        let i = 0;
+        while (r.pos + i < r.len) {
+            bytes.write_byte(r.buf, i, bytes.read_byte(r.buf, r.pos + i));
+            i = i + 1;
+        }
+        r.len = r.len - r.pos;
+        r.pos = 0;
+    }
+    let space = r.cap - r.len;
+    let n = await r.io.recvInto((r.buf + r.len) as int, space);   // parks the coroutine, no thread held
+    if (n <= 0) { return false; }
+    r.len = r.len + n;
+    return true;
+}
+async fn need(r: PgReader, k: int): bool {
+    while (r.len - r.pos < k) { if (!(await fill(r))) { return false; } }
+    return true;
+}
+fn rbyte(r: PgReader): int { let b = bytes.read_byte(r.buf, r.pos); r.pos = r.pos + 1; return b; }
+fn ri32(r: PgReader): int {
+    let a = rbyte(r); let b = rbyte(r); let c = rbyte(r); let d = rbyte(r);
+    return ((a * 256 + b) * 256 + c) * 256 + d;
+}
+
+// A raw protocol frame: [type:byte][len:i32][payload]. `ftype == -1` = broken connection.
+pub struct PgFrame {
+    pub ftype: int,
+    pub payload: string,
+    init(ftype: int, payload: string) { self.ftype = ftype; self.payload = payload; }
+}
+pub async fn readFrame(r: PgReader): PgFrame {
+    if (!(await need(r, 5))) { return PgFrame(-1, ""); }
+    let t = rbyte(r);
+    let len = ri32(r);
+    let plen = len - 4;
+    // Defensive: a corrupt/partial length (server crashed mid-stream or protocol
+    // desync) must not reach bytes.alloc — a negative or multi-GB plen segfaults the
+    // client. Treat as a broken connection; callers already handle the -1 frame.
+    if (plen < 0 || plen > 67108864) { return PgFrame(-1, ""); }
+    if (plen > 0) {
+        if (!(await need(r, plen))) { return PgFrame(-1, ""); }
+    }
+    let out = bytes.alloc(plen);
+    let i = 0;
+    while (i < plen) {
+        bytes.write_byte(out, i, bytes.read_byte(r.buf, r.pos + i));
+        i = i + 1;
+    }
+    r.pos = r.pos + plen;
+    return PgFrame(t, out as string);
+}
+
+pub async fn sendFrame(io: aio.AsyncIO, frame: string): int {
+    return await io.sendStr(frame);
+}

@@ -1,0 +1,272 @@
+// codec — the PostgreSQL v3 wire CODEC (SRP: bytes <-> messages). Frame BUILDERS
+// (startup/query/auth/extended-query) and response DECODERS (RowDescription, DataRow,
+// CommandComplete, ErrorResponse, NotificationResponse, Copy). Pure over byte-buffer
+// strings — the offline gate calls these directly; the connection (postgres.nova) wires
+// them to a live stream via proto. Type interpretation is delegated to typemap.
+import string;
+import list;
+import bytes;
+import db;
+import typemap;
+
+// --- PgFrame writers — binary-safe Nova strings ---------------------------------
+fn byte1(b: int): string {
+    let p = bytes.alloc(1);
+    bytes.write_byte(p, 0, b);
+    return p as string;
+}
+fn i32be(v: int): string {
+    let p = bytes.alloc(4);
+    bytes.write_byte(p, 0, (v / 16777216) % 256);
+    bytes.write_byte(p, 1, (v / 65536) % 256);
+    bytes.write_byte(p, 2, (v / 256) % 256);
+    bytes.write_byte(p, 3, v % 256);
+    return p as string;
+}
+fn i16be(v: int): string {
+    let p = bytes.alloc(2);
+    bytes.write_byte(p, 0, (v / 256) % 256);
+    bytes.write_byte(p, 1, v % 256);
+    return p as string;
+}
+fn cstr(s: string): string { return s + byte1(0); }
+
+// A typed message: [type:byte][len:i32 including itself][payload].
+fn typedFrame(t: int, payload: string): string {
+    return byte1(t) + i32be(4 + payload.length) + payload;
+}
+
+/// Startup: NO type byte. [len i32][protocol 196608][key\0 value\0 ...][\0].
+pub fn buildStartup(user: string, database: string): string {
+    let params = cstr("user") + cstr(user) + cstr("database") + cstr(database)
+        + cstr("application_name") + cstr("nova-pg") + byte1(0);
+    let body = i32be(196608) + params;   // protocol 3.0 = 0x00030000
+    return i32be(4 + body.length) + body;
+}
+// SSLRequest: NO type byte, [len i32 = 8][magic 80877103]. The server replies with a single byte
+// 'S' (83, TLS supported) or 'N' (78, refused), then (on 'S') the TLS handshake runs on this socket.
+pub fn buildSSLRequest(): string { return i32be(8) + i32be(80877103); }
+
+// CancelRequest: NO type byte, [len i32 = 16][magic 80877102][pid i32][secret i32]. Sent on a fresh
+// connection to ask the server to cancel the query in progress on the session identified by (pid, secret).
+pub fn buildCancelRequest(pid: int, secret: int): string {
+    return i32be(16) + i32be(80877102) + i32be(pid) + i32be(secret);
+}
+
+pub fn buildQuery(sql: string): string { return typedFrame(81, cstr(sql)); }  // 'Q'
+pub fn buildPassword(pw: string): string { return typedFrame(112, cstr(pw)); } // 'p'
+pub fn buildTerminate(): string { return typedFrame(88, ""); }                 // 'X'
+
+// --- SASL / SCRAM-SHA-256 auth (AuthenticationSASL flow) ----------------------
+// SASLInitialResponse ('p'): [mechanism cstr][i32 len of client-first][client-first bytes].
+pub fn buildSASLInitial(mechanism: string, clientFirst: string): string {
+    return typedFrame(112, cstr(mechanism) + i32be(clientFirst.length) + clientFirst);
+}
+// SASLResponse ('p'): the raw client-final-message bytes (the frame length bounds it).
+pub fn buildSASLResponse(clientFinal: string): string {
+    return typedFrame(112, clientFinal);
+}
+
+// --- extended-query (prepared statement) frame builders -----------------------
+// Parse ('P'): create a named prepared statement. 0 param type OIDs => let the server infer.
+pub fn buildParse(name: string, sql: string): string {
+    return typedFrame(80, cstr(name) + cstr(sql) + i16be(0));
+}
+// Describe ('D') a STATEMENT ('S'=83): asks for ParameterDescription + RowDescription/NoData.
+pub fn buildDescribeStmt(name: string): string {
+    return typedFrame(68, byte1(83) + cstr(name));
+}
+// Sync ('S'): flush + end the extended-query sequence; the server replies ReadyForQuery.
+pub fn buildSync(): string { return typedFrame(83, ""); }
+// Execute ('E') a portal, `maxRows`=0 meaning "all rows".
+pub fn buildExecute(portal: string, maxRows: int): string {
+    return typedFrame(69, cstr(portal) + i32be(maxRows));
+}
+// Bind ('B'): bind `params` (all TEXT format) to the unnamed portal for statement `name`.
+pub fn buildBind(portal: string, name: string, params: List<DbValue>): string {
+    let body = cstr(portal) + cstr(name) + i16be(0) + i16be(params.size());
+    let i = 0;
+    while (i < params.size()) {
+        let p = params.get(i) ?? db.dbNull();
+        if (p.isNull()) {
+            // length -1 signals SQL NULL — four 0xFF bytes.
+            body = body + byte1(255) + byte1(255) + byte1(255) + byte1(255);
+        } else {
+            let t = typemap.valueToBindText(p);
+            body = body + i32be(t.length) + t;
+        }
+        i = i + 1;
+    }
+    body = body + i16be(0);   // 0 result-format codes => all columns returned as text
+    return typedFrame(66, body);
+}
+// Copy a column list (cached RowDescription) into a fresh owned list — Execute does not resend
+// RowDescription, so a prepared query reuses the cached columns; copying avoids aliasing the
+// cached list into the ResultSet (both would then free it).
+pub fn copyColumns(src: List<Column>): List<Column> {
+    let out = List<Column>();
+    let i = 0;
+    while (i < src.size()) {
+        let c = src.get(i) ?? Column("", DbType.Text);
+        out.push(Column(c.name, c.type_oid));
+        i = i + 1;
+    }
+    return out;
+}
+
+// --- Payload cursor (decode, pure over a byte-buffer string) ------------------
+pub struct PgCursor {
+    pub s: string,
+    pub pos: int,
+    init(s: string) { self.s = s; self.pos = 0; }
+
+    pub fn byte(self: PgCursor): int {
+        let b = self.s[self.pos];
+        self.pos = self.pos + 1;
+        return b;
+    }
+    pub fn i16(self: PgCursor): int {
+        let hi = self.byte();
+        let lo = self.byte();
+        return hi * 256 + lo;
+    }
+    pub fn i32(self: PgCursor): int {
+        let a = self.byte();
+        let b = self.byte();
+        let c = self.byte();
+        let d = self.byte();
+        return ((a * 256 + b) * 256 + c) * 256 + d;
+    }
+    // A NUL-terminated C-string.
+    pub fn cstr(self: PgCursor): string {
+        let start = self.pos;
+        while (self.s[self.pos] != 0) { self.pos = self.pos + 1; }
+        let out = string.slice(self.s, start, self.pos);
+        self.pos = self.pos + 1;   // skip the NUL
+        return out;
+    }
+    pub fn take(self: PgCursor, n: int): string {
+        let out = string.slice(self.s, self.pos, self.pos + n);
+        self.pos = self.pos + n;
+        return out;
+    }
+    pub fn skip(self: PgCursor, n: int): void { self.pos = self.pos + n; }
+}
+
+// --- Response decoders (pure; the offline gate calls these directly) ----------
+
+/// RowDescription ('T'): field_count(i16) + per field {name(cstr), table_oid(i32),
+/// col_attr(i16), type_oid(i32), type_size(i16), type_mod(i32), format(i16)}.
+pub fn decodeRowDesc(payload: string): List<Column> {
+    let cols = List<Column>();
+    let c = PgCursor(payload);
+    let n = c.i16();
+    let i = 0;
+    while (i < n) {
+        let name = c.cstr();
+        c.skip(4);           // table_oid
+        c.skip(2);           // col_attr
+        let oid = c.i32();   // type_oid
+        c.skip(2);           // type_size
+        c.skip(4);           // type_mod
+        c.skip(2);           // format
+        cols.push(Column(name, typemap.oidToDbType(oid)));
+        i = i + 1;
+    }
+    return cols;
+}
+
+/// DataRow ('D'): field_count(i16) + per field {len(i32, -1=NULL), bytes}.
+pub fn decodeDataRow(payload: string, cols: List<Column>): Row {
+    let row = Row();
+    let c = PgCursor(payload);
+    let n = c.i16();
+    let i = 0;
+    while (i < n) {
+        let len = c.i32();
+        let col = cols.get(i) ?? Column("", DbType.Text);
+        // -1 length = NULL; reads back as signed i32 -1 or 4294967295 depending on int width.
+        if (len == 4294967295 || len == -1) {
+            row.cells.push(typemap.decodeCell(col.type_oid, "", true));
+        } else {
+            row.cells.push(typemap.decodeCell(col.type_oid, c.take(len), false));
+        }
+        i = i + 1;
+    }
+    return row;
+}
+
+/// CommandComplete ('C') -> tag cstring (e.g. "SELECT 2", "INSERT 0 1").
+pub fn decodeTag(payload: string): string {
+    let c = PgCursor(payload);
+    return c.cstr();
+}
+
+/// ErrorResponse ('E'): a series of {field_tag(byte), value(cstr)} ending at a 0 tag.
+/// We pull 'C' (SQLSTATE code) and 'M' (message).
+pub fn decodeError(payload: string): DbError {
+    let c = PgCursor(payload);
+    let code = "";
+    let msg = "";
+    while (true) {
+        let tag = c.byte();
+        if (tag == 0) { break; }
+        let val = c.cstr();
+        if (tag == 67) { code = val; }   // 'C' SQLSTATE
+        if (tag == 77) { msg = val; }    // 'M' message
+    }
+    return DbError(code, msg);
+}
+
+// --- LISTEN/NOTIFY — NotificationResponse ('A') -------------------------------
+pub struct PgNotification {
+    pub pid: int,        // process id of the notifying backend
+    pub channel: string, // the channel name (matches the LISTEN target)
+    pub payload: string, // optional payload text ("" if NOTIFY sent none)
+    init(pid: int, channel: string, payload: string) {
+        self.pid = pid;
+        self.channel = channel;
+        self.payload = payload;
+    }
+}
+
+/// NotificationResponse ('A'): int32 process-id, then a NUL-terminated channel name,
+/// then a NUL-terminated payload string. Pure — the offline gate calls this directly.
+pub fn decodeNotification(payload: string): PgNotification {
+    let c = PgCursor(payload);
+    let pid = c.i32();
+    let channel = c.cstr();
+    let text = c.cstr();
+    return PgNotification(pid, channel, text);
+}
+
+// --- COPY sub-protocol (decode side) ------------------------------------------
+pub struct PgCopyInfo {
+    pub format: int,   // overall copy format: 0 = textual, 1 = binary
+    pub columns: int,  // number of columns in the copy stream
+    init(format: int, columns: int) {
+        self.format = format;
+        self.columns = columns;
+    }
+}
+
+/// CopyOutResponse ('H') / CopyInResponse ('G') header: int8 overall format,
+/// int16 numColumns, then int16[numColumns] per-column formats (ignored here).
+pub fn decodeCopyResponse(payload: string): PgCopyInfo {
+    let c = PgCursor(payload);
+    let format = c.byte();
+    let columns = c.i16();
+    return PgCopyInfo(format, columns);
+}
+
+/// CopyData ('d') carries one raw row chunk — the whole payload IS the data. 'c' CopyDone
+/// is empty and needs no decoder. This extractor returns the chunk bytes verbatim.
+pub fn decodeCopyData(payload: string): string { return payload; }
+
+// "SELECT 2" / "INSERT 0 1" / "UPDATE 3" -> the trailing count.
+pub fn tagCount(tag: string): int {
+    let sp = string.lastIndexOf(tag, " ");
+    if (sp == -1) { return 0; }
+    let num = string.slice(tag, sp + 1, tag.length);
+    return string.parseI64(num);
+}
