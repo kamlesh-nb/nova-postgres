@@ -72,7 +72,13 @@ pub async fn readFrame(r: PgReader): PgFrame {
         i = i + 1;
     }
     r.pos = r.pos + plen;
-    return PgFrame(t, out as string);
+    // Bind the `as string` cast to a local so ownership of the freshly-alloc'd buffer transfers to ARC and
+    // the payload is freed when the frame drops. An inline `PgFrame(t, out as string)` leaves the cast a
+    // borrow (a cast's ownership is intentionally ambiguous — see arc.zig), so the per-frame buffer leaks
+    // under load (a large per-row server leak). Binding first is the clean, explicit pattern (matches
+    // nova-novadb).
+    let payload = out as string;
+    return PgFrame(t, payload);
 }
 
 pub async fn sendFrame(io: aio.AsyncIO, frame: string): int {

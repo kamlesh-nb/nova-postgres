@@ -44,6 +44,8 @@ pub struct PgConnection impl Connection {
     pub secret: int,
     pub busy: bool,              // concurrency guard: one in-flight request per connection
     pub notes: List<PgNotification>,  // async NOTIFYs captured off the wire during query/exec
+    pub failed: bool,            // set when connect failed closed (e.g. TLS required but refused)
+    pub failErr: string,         // the failure reason surfaced to the first query/exec
     init(io: aio.AsyncIO, reader: PgReader, host: string, port: int, pid: int, secret: int) {
         self.io = io;
         self.reader = reader;
@@ -54,14 +56,29 @@ pub struct PgConnection impl Connection {
         self.secret = secret;
         self.busy = false;
         self.notes = List<PgNotification>();
+        self.failed = false;
+        self.failErr = "";
     }
+    // Mark this connection dead (fail-closed at connect). The first query/exec returns the reason.
+    pub fn markFailed(self, why: string): void { self.failed = true; self.failErr = why; }
 
     pub async fn query(self, sql: string, params: List<DbValue>): ResultSet {
         // A connection is a single request/response channel; a second concurrent query would interleave
         // frames and corrupt the stream. Refuse re-entry instead (use a pool for concurrency).
+        if (self.failed) { return db.errorResult(db.DbError("", self.failErr)); }
         if (self.busy) { return db.errorResult(db.DbError("", "connection busy: concurrent use")); }
         self.busy = true;
-        let sn = await proto.sendFrame(self.io, codec.buildQuery(typemap.substituteParams(sql, params)));
+        // SECURITY: when there are params, send them as SERVER-BOUND values over the extended-query
+        // protocol (Parse/Bind/Execute) instead of interpolating them into the SQL text. This makes
+        // SQL injection structurally impossible on the standard path. No-param SQL keeps the simple
+        // Query path (supports multi-statement / DDL that the extended protocol rejects).
+        let rs = if (params.size() > 0) await self.runExtended(sql, params) else await self.runSimple(sql);
+        self.busy = false;
+        return rs;
+    }
+    // Simple Query ('Q') — one round trip, no bound params. Used for no-param SQL only.
+    async fn runSimple(self, sql: string): ResultSet {
+        let sn = await proto.sendFrame(self.io, codec.buildQuery(sql));
         let rs = ResultSet();
         while (true) {
             let f = await proto.readFrame(self.reader);
@@ -76,27 +93,43 @@ pub struct PgConnection impl Connection {
             if (f.ftype == 69) { rs.err = codec.decodeError(f.payload); }          // 'E' ErrorResponse
             if (f.ftype == 65) { self.notes.push(codec.decodeNotification(f.payload)); } // 'A' NotificationResponse
         }
-        self.busy = false;
+        return rs;
+    }
+    // Extended query on the UNNAMED statement/portal: Parse, Describe (for RowDescription), Bind the
+    // params as real protocol values, Execute all rows, Sync. Params never touch the SQL string.
+    async fn runExtended(self, sql: string, params: List<DbValue>): ResultSet {
+        let p1 = await proto.sendFrame(self.io, codec.buildParse("", sql));
+        let p2 = await proto.sendFrame(self.io, codec.buildDescribeStmt(""));
+        let p3 = await proto.sendFrame(self.io, codec.buildBind("", "", params));
+        let p4 = await proto.sendFrame(self.io, codec.buildExecute("", 0));
+        let p5 = await proto.sendFrame(self.io, codec.buildSync());
+        let rs = ResultSet();
+        while (true) {
+            let f = await proto.readFrame(self.reader);
+            if (f.ftype == -1) { break; }
+            if (f.ftype == 90) { break; }                                    // 'Z' ReadyForQuery
+            if (f.ftype == 84) { rs.columns = codec.decodeRowDesc(f.payload); }    // 'T' RowDescription
+            if (f.ftype == 68) { rs.rows.push(codec.decodeDataRow(f.payload, rs.columns)); } // 'D'
+            if (f.ftype == 67) {                                             // 'C' CommandComplete
+                rs.tag = codec.decodeTag(f.payload);
+                rs.rows_affected = codec.tagCount(rs.tag);
+            }
+            if (f.ftype == 69) { rs.err = codec.decodeError(f.payload); }          // 'E' ErrorResponse
+            if (f.ftype == 65) { self.notes.push(codec.decodeNotification(f.payload)); } // 'A'
+            // '1' ParseComplete / '2' BindComplete / 't' ParameterDescription / 'n' NoData: ignored.
+        }
         return rs;
     }
 
     pub async fn exec(self, sql: string, params: List<DbValue>): ExecResult {
+        if (self.failed) { return errorExec(db.DbError("", self.failErr)); }
         if (self.busy) { return errorExec(db.DbError("", "connection busy: concurrent use")); }
         self.busy = true;
-        let sn = await proto.sendFrame(self.io, codec.buildQuery(typemap.substituteParams(sql, params)));
-        let tag = "";
-        let err = noError();
-        while (true) {
-            let f = await proto.readFrame(self.reader);
-            if (f.ftype == -1) { break; }
-            if (f.ftype == 90) { break; }
-            if (f.ftype == 67) { tag = codec.decodeTag(f.payload); }
-            if (f.ftype == 69) { err = codec.decodeError(f.payload); }             // 'E' ErrorResponse
-            if (f.ftype == 65) { self.notes.push(codec.decodeNotification(f.payload)); } // 'A' NotificationResponse
-        }
+        // Same server-bound-param path as query() (see the SECURITY note there).
+        let rs = if (params.size() > 0) await self.runExtended(sql, params) else await self.runSimple(sql);
         self.busy = false;
-        if (!err.isEmpty()) { return errorExec(err); }
-        return ExecResult(codec.tagCount(tag), tag);
+        if (!rs.err.isEmpty()) { return errorExec(rs.err); }
+        return ExecResult(rs.rows_affected, rs.tag);
     }
 
     pub fn close(self): void {
@@ -259,7 +292,7 @@ async fn pgConnectAsync(connectionString: string): PgConnection {
     bytes.free(rb);
 
     if (sslByte == 83) {   // 'S' — upgrade this socket to TLS
-        if (string.eql(d.sslmode, "verify-full")) {
+        if (string.eql(d.sslmode, "verify-full") || string.eql(d.sslmode, "verify-ca")) {
             let caPem = if (d.sslrootcert != "") File.readText(d.sslrootcert) else "";
             let ts = await asynctls.tlsClientUpgradeVerify(base, d.host, caPem);
             return await pgStartup(ts, d);
@@ -267,8 +300,14 @@ async fn pgConnectAsync(connectionString: string): PgConnection {
         let ts2 = await asynctls.tlsClientUpgrade(base, d.host);
         return await pgStartup(ts2, d);
     }
-    // 'N': server refused TLS. Best-effort fallback to plaintext for now; fail-closed enforcement
-    // (require/verify-full MUST NOT continue unencrypted) needs the connect error channel (T1 residual).
+    // 'N': the server refused TLS. Fail CLOSED when the sslmode mandates encryption -- continuing in
+    // plaintext would let a MITM that strips the SSLRequest silently downgrade a require/verify client.
+    // Only disable/prefer/allow may fall back to plaintext.
+    if (string.eql(d.sslmode, "require") || string.eql(d.sslmode, "verify-ca") || string.eql(d.sslmode, "verify-full")) {
+        let dead = PgConnection(base, PgReader(base), d.host, d.port, 0, 0);
+        dead.markFailed("postgres: sslmode=" + d.sslmode + " requires TLS but the server refused it");
+        return dead;
+    }
     return await pgStartup(base, d);
 }
 
@@ -294,7 +333,7 @@ async fn pgStartup(io: aio.AsyncIO, d: ConnectionOptions): PgConnection {
             secret = kc.i32();
         }
         if (f.ftype == 82) {            // 'R' Authentication — delegate to auth
-            await auth.handleAuth(io, f.payload, d.password, scram);
+            await auth.handleAuth(io, f.payload, d.user, d.password, scram);
         }
         if (f.ftype == 69) {            // 'E' ErrorResponse during startup
             break;

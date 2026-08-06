@@ -4,10 +4,14 @@
 // built by codec; this module decides WHICH to send for a given 'R' message and drives
 // the ScramClient state across the multi-message SCRAM exchange.
 import net.aio;
+import string;
 import crypto.scram;
 import crypto.random;
+import crypto.hash.md5;
 import codec;
 import proto;
+
+// `md5.md5` already returns the 32-char lowercase-hex digest, so MD5 auth composes it directly.
 
 // Build the per-connection SCRAM client. The client nonce is 36 hex chars from the
 // pure-Nova CSPRNG (crypto/random over /dev/urandom). One instance lives across the whole
@@ -23,11 +27,16 @@ pub fn newScramClient(user: string, password: string): ScramClient {
 //   10 = AuthenticationSASL        -> offer SCRAM-SHA-256 (client-first)
 //   11 = AuthenticationSASLContinue -> server-first-message -> client-final
 //   12 = SASLFinal, 0 = Ok         -> nothing to send.  MD5 (5) is unsupported.
-pub async fn handleAuth(io: aio.AsyncIO, payload: string, password: string, scram: ScramClient): void {
+pub async fn handleAuth(io: aio.AsyncIO, payload: string, user: string, password: string, scram: ScramClient): void {
     let c = codec.PgCursor(payload);
     let kind = c.i32();
     if (kind == 3) {
         let a1 = await proto.sendFrame(io, codec.buildPassword(password));
+    }
+    if (kind == 5) {
+        // AuthenticationMD5Password: 4-byte salt follows. Response = "md5" + md5hex(md5hex(pw+user)+salt).
+        let salt = c.take(4);
+        let a5 = await proto.sendFrame(io, codec.buildPassword("md5" + md5.md5(md5.md5(password + user) + salt)));
     }
     if (kind == 10) {
         let a2 = await proto.sendFrame(io, codec.buildSASLInitial("SCRAM-SHA-256", scram.clientFirstMessage()));

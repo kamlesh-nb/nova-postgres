@@ -208,14 +208,34 @@ pub fn decodeError(payload: string): DbError {
     let c = PgCursor(payload);
     let code = "";
     let msg = "";
+    let detail = "";
     while (true) {
         let tag = c.byte();
         if (tag == 0) { break; }
         let val = c.cstr();
         if (tag == 67) { code = val; }   // 'C' SQLSTATE
         if (tag == 77) { msg = val; }    // 'M' message
+        if (tag == 68) { detail = val; } // 'D' detail
     }
-    return DbError(code, msg);
+    let full = if (string.eql(detail, "")) msg else msg + " (" + detail + ")";
+    return DbError(code, full).with(0, classifySqlState(code));
+}
+// Map a Postgres SQLSTATE onto the normalized db.DBERR_* taxonomy (class = first 2 chars).
+fn classifySqlState(code: string): int {
+    if (string.eql(code, "23505")) { return db.DBERR_UNIQUE_VIOLATION; }
+    if (string.eql(code, "23502")) { return db.DBERR_NOT_NULL; }
+    if (string.eql(code, "23503")) { return db.DBERR_FOREIGN_KEY; }
+    if (string.eql(code, "23514")) { return db.DBERR_CHECK; }
+    if (string.eql(code, "40P01")) { return db.DBERR_DEADLOCK; }
+    if (string.eql(code, "40001")) { return db.DBERR_SERIALIZATION; }
+    if (string.eql(code, "55P03")) { return db.DBERR_LOCK_TIMEOUT; }
+    if (code.length >= 2) {
+        let cls = string.slice(code, 0, 2);
+        if (string.eql(cls, "42")) { return db.DBERR_SYNTAX; }
+        if (string.eql(cls, "28")) { return db.DBERR_AUTH; }
+        if (string.eql(cls, "08")) { return db.DBERR_CONNECTION; }
+    }
+    return db.DBERR_UNKNOWN;
 }
 
 // --- LISTEN/NOTIFY — NotificationResponse ('A') -------------------------------
