@@ -221,6 +221,28 @@ pub struct PgConnection impl Connection {
     pub async fn commit(self): ExecResult { return await self.exec("COMMIT", List<DbValue>()); }
     pub async fn rollback(self): ExecResult { return await self.exec("ROLLBACK", List<DbValue>()); }
 
+    // Begin a transaction at an explicit isolation level: "READ COMMITTED", "REPEATABLE READ",
+    // "SERIALIZABLE" (or "READ UNCOMMITTED", which Postgres treats as READ COMMITTED). Unblocks
+    // deadlock/serialization-retry patterns that need a stronger-than-default isolation.
+    pub async fn beginIsolation(self, level: string): ExecResult {
+        return await self.exec("BEGIN ISOLATION LEVEL " + level, List<DbValue>());
+    }
+    // Begin a read-only transaction (the planner can skip write-path bookkeeping; a good default for
+    // report/consistency reads).
+    pub async fn beginReadOnly(self): ExecResult {
+        return await self.exec("BEGIN READ ONLY", List<DbValue>());
+    }
+    // Savepoints for partial rollback within a transaction. `name` must be a valid SQL identifier.
+    pub async fn savepoint(self, name: string): ExecResult {
+        return await self.exec("SAVEPOINT " + name, List<DbValue>());
+    }
+    pub async fn rollbackTo(self, name: string): ExecResult {
+        return await self.exec("ROLLBACK TO SAVEPOINT " + name, List<DbValue>());
+    }
+    pub async fn releaseSavepoint(self, name: string): ExecResult {
+        return await self.exec("RELEASE SAVEPOINT " + name, List<DbValue>());
+    }
+
     // --- LISTEN/NOTIFY --------------------------------------------------------
     // Register interest in a channel. Runs `LISTEN <channel>` via the normal exec path (the
     // server replies CommandComplete); subsequent NOTIFYs arrive as async 'A' frames, which the

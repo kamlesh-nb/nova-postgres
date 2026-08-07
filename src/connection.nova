@@ -3,6 +3,38 @@
 // Pure string work; no I/O, no db seam. The seam (postgres.nova) turns a ConnectionOptions into a
 // live connection.
 import string;
+import bytes;
+
+fn hexVal(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }    // 0-9
+    if (c >= 65 && c <= 70) { return c - 55; }    // A-F
+    if (c >= 97 && c <= 102) { return c - 87; }   // a-f
+    return -1;
+}
+fn charByte(v: int): string {
+    let p = bytes.alloc(1);
+    bytes.write_byte(p, 0, v & 255);
+    let r = bytes.read_string(p, 1);
+    bytes.free(p);
+    return r;
+}
+// Percent-decode a URL component (RFC 3986). A password like `p@ss:w%2Frd` is written in a DSN as
+// `p%40ss%3Aw%252Frd`; without decoding the driver would authenticate with the literal escaped text.
+// A lone `%` not followed by two hex digits is passed through unchanged.
+fn percentDecode(s: string): string {
+    if (string.indexOf(s, "%") == -1) { return s; }   // fast path: nothing escaped
+    let out = "";
+    let i = 0;
+    while (i < s.length) {
+        if (s[i] == 37 && i + 2 < s.length) {         // '%' + 2 more chars
+            let h = hexVal(s[i + 1] & 255);
+            let l = hexVal(s[i + 2] & 255);
+            if (h >= 0 && l >= 0) { out = out + charByte(h * 16 + l); i = i + 3; }
+            else { out = out + string.slice(s, i, i + 1); i = i + 1; }
+        } else { out = out + string.slice(s, i, i + 1); i = i + 1; }
+    }
+    return out;
+}
 
 pub struct ConnectionOptions {
     pub host: string,
@@ -51,26 +83,37 @@ pub fn parse(connectionString: string): ConnectionOptions {
         s = string.slice(s, at + 1, s.length);
         let colon = string.indexOf(cred, ":");
         if (colon == -1) {
-            user = cred;
+            user = percentDecode(cred);
         } else {
-            user = string.slice(cred, 0, colon);
-            password = string.slice(cred, colon + 1, cred.length);
+            user = percentDecode(string.slice(cred, 0, colon));
+            password = percentDecode(string.slice(cred, colon + 1, cred.length));
         }
     }
 
     let database = user;
     let slash = string.indexOf(s, "/");
     if (slash != -1) {
-        database = string.slice(s, slash + 1, s.length);
+        database = percentDecode(string.slice(s, slash + 1, s.length));
         s = string.slice(s, 0, slash);
     }
 
     let host = s;
     let port = 5432;
-    let pc = string.lastIndexOf(s, ":");
-    if (pc != -1) {
-        host = string.slice(s, 0, pc);
-        port = string.parseI64(string.slice(s, pc + 1, s.length));
+    if (s.length > 0 && s[0] == 91) {
+        // IPv6 literal: [::1] or [::1]:5432. lastIndexOf(":") would split inside the address, so parse
+        // the bracketed host explicitly and take the port only from a `]:port` suffix.
+        let rb = string.indexOf(s, "]");
+        if (rb != -1) {
+            host = string.slice(s, 1, rb);
+            let after = string.slice(s, rb + 1, s.length);
+            if (after.length > 0 && after[0] == 58) { port = string.parseI64(string.slice(after, 1, after.length)); }
+        }
+    } else {
+        let pc = string.lastIndexOf(s, ":");
+        if (pc != -1) {
+            host = string.slice(s, 0, pc);
+            port = string.parseI64(string.slice(s, pc + 1, s.length));
+        }
     }
     return ConnectionOptions(host, port, user, password, database, sslmode, sslrootcert);
 }
