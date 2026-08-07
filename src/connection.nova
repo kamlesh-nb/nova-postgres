@@ -63,6 +63,14 @@ fn queryParam(connectionString: string, key: string, dflt: string): string {
     return string.slice(rest, 0, amp);
 }
 
+// The connect deadline in milliseconds. `?connect_timeout=<seconds>` (libpq-style), default 10 s. A
+// value <= 0 disables the deadline (wait forever). Bounds a dead/firewalled host at connect time.
+pub fn connectTimeoutMs(connectionString: string): int {
+    let secs = string.parseI64(queryParam(connectionString, "connect_timeout", "10")) as int;
+    if (secs < 0) { return 0; }
+    return secs * 1000;
+}
+
 // postgresql://user[:password]@host[:port]/database   (scheme optional; sane defaults)
 pub fn parse(connectionString: string): ConnectionOptions {
     let sslmode = queryParam(connectionString, "sslmode", "disable");

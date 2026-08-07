@@ -391,7 +391,12 @@ pub async fn open(connectionString: string): PgConnection {
 // asio io_context through the entire handshake.
 async fn pgConnectAsync(connectionString: string): PgConnection {
     let d = connection.parse(connectionString);
-    let base = await aio.asyncConnect(d.host, d.port);
+    let base = await aio.asyncConnectDeadline(d.host, d.port, connection.connectTimeoutMs(connectionString));
+    if (!base.ok()) {
+        let dead = PgConnection(base, PgReader(base), d.host, d.port, 0, 0);
+        dead.markFailed("postgres: connect timed out or refused: " + d.host + ":" + `${d.port}`);
+        return dead;
+    }
 
     // sslmode=disable (default): plaintext, unchanged path.
     if (string.eql(d.sslmode, "disable")) {
