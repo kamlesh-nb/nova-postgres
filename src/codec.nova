@@ -78,6 +78,10 @@ pub fn buildDescribeStmt(name: string): string {
 }
 // Sync ('S'): flush + end the extended-query sequence; the server replies ReadyForQuery.
 pub fn buildSync(): string { return typedFrame(83, ""); }
+// Flush ('H'): force the server to send its buffered responses WITHOUT ending the implicit transaction
+// (unlike Sync). Needed to stream a portal batch-by-batch: after Execute the server holds its output
+// until it sees a Flush or Sync, so a getMore-style loop without Sync must Flush to receive each batch.
+pub fn buildFlush(): string { return typedFrame(72, ""); }
 // Execute ('E') a portal, `maxRows`=0 meaning "all rows".
 pub fn buildExecute(portal: string, maxRows: int): string {
     return typedFrame(69, cstr(portal) + i32be(maxRows));

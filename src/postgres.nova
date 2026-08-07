@@ -267,6 +267,98 @@ pub struct PgConnection impl Connection {
         let _ = await side.sendStr(codec.buildCancelRequest(self.pid, self.secret));
         side.close();
     }
+
+    // --- X4: true streaming via a portal --------------------------------------
+    // Stream a query's rows in server-fetched batches instead of buffering the whole set, using the
+    // extended-query protocol with a NAMED portal and Execute(maxRows). Iterate the returned cursor:
+    //   let cur = await conn.queryStream("SELECT ...", params, 500);
+    //   while (let row = await cur.next()) { ... }
+    //   let _ = await cur.close();
+    // batchSize <= 0 defaults to 100. The connection stays busy until the cursor is drained or closed.
+    pub async fn queryStream(self, sql: string, params: List<DbValue>, batchSize: int): Cursor {
+        if (self.failed) { return db.cursorOver(db.errorResult(db.DbError("", self.failErr))); }
+        if (self.busy) { return db.cursorOver(db.errorResult(db.DbError("", "connection busy: concurrent use"))); }
+        self.busy = true;
+        let bs = if (batchSize > 0) batchSize else 100;
+        let src: RowBatchSource = PgRowSource(self, sql, params, bs);
+        return Cursor(src);
+    }
+}
+
+// A lazy row source over a postgres portal: Parse+Bind+Describe+Execute(batch) on the first fetch, then
+// Execute(batch) again per fetch, WITHOUT a Sync between batches so the implicit transaction (and thus
+// the portal) stays alive. PortalSuspended ('s') means more rows; CommandComplete ('C') ends the stream,
+// at which point Sync drains to ReadyForQuery and frees the connection. Errors ('E') also finish + resync.
+pub struct PgRowSource impl RowBatchSource {
+    pub conn: PgConnection,
+    pub sql: string,
+    pub params: List<DbValue>,
+    pub portal: string,
+    pub batchSize: int,
+    pub cols: List<Column>,
+    pub started: bool,
+    pub done: bool,
+    pub e: DbError,
+    init(conn: PgConnection, sql: string, params: List<DbValue>, batchSize: int) {
+        self.conn = conn; self.sql = sql; self.params = params;
+        self.portal = "nova_cur"; self.batchSize = batchSize;
+        self.cols = List<Column>(); self.started = false; self.done = false; self.e = noError();
+    }
+
+    async fn fetchBatch(self: PgRowSource): List<Row> {
+        let rows = List<Row>();
+        if (self.done) { return rows; }
+        if (!self.started) {
+            let _1 = await proto.sendFrame(self.conn.io, codec.buildParse("", self.sql));
+            let _2 = await proto.sendFrame(self.conn.io, codec.buildDescribeStmt(""));
+            let _3 = await proto.sendFrame(self.conn.io, codec.buildBind(self.portal, "", self.params));
+            let _4 = await proto.sendFrame(self.conn.io, codec.buildExecute(self.portal, self.batchSize));
+            self.started = true;   // NO Sync yet: keep the portal alive across batches.
+        } else {
+            let _e = await proto.sendFrame(self.conn.io, codec.buildExecute(self.portal, self.batchSize));
+        }
+        // Flush forces the server to send this batch's responses without ending the implicit transaction
+        // (Sync would drop the portal). Without it the server holds its output and readFrame blocks.
+        let _fl = await proto.sendFrame(self.conn.io, codec.buildFlush());
+        while (true) {
+            let f = await proto.readFrame(self.conn.reader);
+            if (f.ftype == -1) { self.done = true; self.conn.busy = false; break; }   // broken connection
+            if (f.ftype == 84) { self.cols = codec.decodeRowDesc(f.payload); }         // 'T' RowDescription
+            if (f.ftype == 68) { rows.push(codec.decodeDataRow(f.payload, self.cols)); } // 'D' DataRow
+            if (f.ftype == 65) { self.conn.notes.push(codec.decodeNotification(f.payload)); } // 'A'
+            if (f.ftype == 115) { break; }                                            // 's' PortalSuspended -> more
+            if (f.ftype == 67) { await self.finish(); break; }                        // 'C' CommandComplete -> done
+            if (f.ftype == 69) { self.e = codec.decodeError(f.payload); await self.finish(); break; } // 'E'
+            // '1' ParseComplete / '2' BindComplete / 't' ParameterDescription / 'n' NoData -> ignore.
+        }
+        return rows;
+    }
+
+    // End the extended-query sequence: Sync, drain to ReadyForQuery (this also closes the portal), mark
+    // done and release the connection.
+    async fn finish(self: PgRowSource): void {
+        if (self.done) { return; }
+        let _s = await proto.sendFrame(self.conn.io, codec.buildSync());
+        while (true) {
+            let f = await proto.readFrame(self.conn.reader);
+            if (f.ftype == -1) { break; }
+            if (f.ftype == 90) { break; }                                             // 'Z' ReadyForQuery
+            if (f.ftype == 69 && self.e.isEmpty()) { self.e = codec.decodeError(f.payload); }
+        }
+        self.done = true;
+        self.conn.busy = false;
+    }
+
+    fn columns(self: PgRowSource): List<Column> { return self.cols; }
+    fn err(self: PgRowSource): DbError { return self.e; }
+    async fn close(self: PgRowSource): void { if (!self.done) { await self.finish(); } }
+}
+
+/// Connect and return the CONCRETE PgConnection (so callers can reach queryStream and the pg-specific
+/// helpers: listen/notifications/copyOut/cancel). Driver.connect returns the Connection trait; this is
+/// the postgres analogue of mongodb.open.
+pub async fn open(connectionString: string): PgConnection {
+    return await pgConnectAsync(connectionString);
 }
 
 /// The PostgreSQL driver. connection string: `postgresql://user@host:port/database` (password optional
