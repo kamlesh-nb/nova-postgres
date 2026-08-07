@@ -410,13 +410,14 @@ async fn pgConnectAsync(connectionString: string): PgConnection {
     let sslByte = if (rn > 0) bytes.read_byte(rb, 0) else 0;
     bytes.free(rb);
 
-    if (sslByte == 83) {   // 'S' — upgrade this socket to TLS
+    if (sslByte == 83) {   // 'S' — upgrade this socket to TLS (handshake bounded by connect_timeout)
+        let toMs = connection.connectTimeoutMs(connectionString);
         if (string.eql(d.sslmode, "verify-full") || string.eql(d.sslmode, "verify-ca")) {
             let caPem = if (d.sslrootcert != "") File.readText(d.sslrootcert) else "";
-            let ts = await asynctls.tlsClientUpgradeVerify(base, d.host, caPem);
+            let ts = await asynctls.tlsClientUpgradeVerifyDeadline(base, d.host, caPem, toMs);
             return await pgStartup(ts, d);
         }
-        let ts2 = await asynctls.tlsClientUpgrade(base, d.host);
+        let ts2 = await asynctls.tlsClientUpgradeDeadline(base, d.host, toMs);
         return await pgStartup(ts2, d);
     }
     // 'N': the server refused TLS. Fail CLOSED when the sslmode mandates encryption -- continuing in
