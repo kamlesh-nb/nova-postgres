@@ -32,7 +32,7 @@ async fn fill(r: PgReader): bool {
         r.pos = 0;
     }
     let space = r.cap - r.len;
-    let n = await r.io.recvInto((r.buf + r.len) as int, space);   // parks the coroutine, no thread held
+    let n = await r.io.recvInto((r.buf as long) + (r.len as long), space);   // parks the coroutine, no thread held. 64-bit addr: `as int` here TRUNCATES a >4GB heap address (mmap allocator) -> reads into a garbage pointer -> empty result.
     if (n <= 0) { return false; }
     r.len = r.len + n;
     return true;
