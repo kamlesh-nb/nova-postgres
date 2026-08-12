@@ -8,6 +8,16 @@ import list;
 import bytes;
 import db;
 import typemap;
+import collections.string_builder;
+
+// Direct byte-append helpers for building wire frames into ONE StringBuilder buffer, instead of many tiny
+// per-field string allocations (byte1/i16be/i32be each malloc'd + concatenated). appendChar writes one raw
+// byte. Used by buildBind on the hot query path.
+fn sbI16(sb: string_builder.StringBuilder, v: int): void { sb.appendChar((v / 256) % 256); sb.appendChar(v % 256); }
+fn sbI32(sb: string_builder.StringBuilder, v: int): void {
+    sb.appendChar((v / 16777216) % 256); sb.appendChar((v / 65536) % 256); sb.appendChar((v / 256) % 256); sb.appendChar(v % 256);
+}
+fn sbCstr(sb: string_builder.StringBuilder, s: string): void { sb.append(s); sb.appendChar(0); }
 
 // --- PgFrame writers — binary-safe Nova strings ---------------------------------
 fn byte1(b: int): string {
@@ -87,22 +97,40 @@ pub fn buildExecute(portal: string, maxRows: int): string {
     return typedFrame(69, cstr(portal) + i32be(maxRows));
 }
 // Bind ('B'): bind `params` (all TEXT format) to the unnamed portal for statement `name`.
-pub fn buildBind(portal: string, name: string, params: List<DbValue>): string {
-    let body = cstr(portal) + cstr(name) + i16be(0) + i16be(params.size());
+// `cols` is the statement's RowDescription (from a prior Describe) and `binary` requests binary result
+// format PER COLUMN for the fixed-width types (isBinaryCol) while leaving the rest as text. When `binary`
+// is false or `cols` is empty (the simple-query / pre-Describe paths, which cannot know the columns at
+// Bind time), all columns come back as text -- exactly the old behaviour.
+pub fn buildBind(portal: string, name: string, params: List<DbValue>, cols: List<Column>, binary: bool): string {
+    // Build the Bind body by appending bytes into ONE buffer -- no per-field mallocs, no O(n^2) concat.
+    let sb = string_builder.StringBuilder();
+    sbCstr(sb, portal); sbCstr(sb, name);
+    sbI16(sb, 0);                          // 0 param format codes => all params text
+    sbI16(sb, params.size());
     let i = 0;
     while (i < params.size()) {
         let p = params.get(i) ?? db.dbNull();
         if (p.isNull()) {
-            // length -1 signals SQL NULL — four 0xFF bytes.
-            body = body + byte1(255) + byte1(255) + byte1(255) + byte1(255);
+            sb.appendChar(255); sb.appendChar(255); sb.appendChar(255); sb.appendChar(255);   // len -1 = NULL
         } else {
             let t = typemap.valueToBindText(p);
-            body = body + i32be(t.length) + t;
+            sbI32(sb, t.length);
+            sb.append(t);
         }
         i = i + 1;
     }
-    body = body + i16be(0);   // 0 result-format codes => all columns returned as text
-    return typedFrame(66, body);
+    if (binary && cols.size() > 0) {
+        sbI16(sb, cols.size());
+        let k = 0;
+        while (k < cols.size()) {
+            let col = cols.get(k) ?? Column("", DbType.Text);
+            sbI16(sb, isBinaryCol(col.type_oid) ? 1 : 0);
+            k = k + 1;
+        }
+    } else {
+        sbI16(sb, 0);   // 0 result-format codes => all columns returned as text
+    }
+    return typedFrame(66, sb.toString());
 }
 // Copy a column list (cached RowDescription) into a fresh owned list — Execute does not resend
 // RowDescription, so a prepared query reuses the cached columns; copying avoids aliasing the
@@ -112,20 +140,38 @@ pub fn copyColumns(src: List<Column>): List<Column> {
     let i = 0;
     while (i < src.size()) {
         let c = src.get(i) ?? Column("", DbType.Text);
-        out.push(Column(c.name, c.type_oid));
+        // DEEP-copy the name so the returned (per-request / arena) column list fully OWNS its strings. Under
+        // the P7 request arena, `src` is the connection's PERSISTENT prepared-statement column cache; sharing
+        // its name pointer would make ARC decrement the cached string when this request's list is released,
+        // draining the cache's refcount to zero after a few requests -> use-after-free (ASAN: nova_release).
+        out.push(Column(string.slice(c.name, 0, c.name.length), c.type_oid));
         i = i + 1;
     }
     return out;
 }
 
 // --- Payload cursor (decode, pure over a byte-buffer string) ------------------
+// Copy [start,end) out of a raw byte buffer into a fresh Nova string (memcpy). This is the ONLY place a
+// cell/field is materialised; everything up to here is a view into the reader's buffer (zero-copy).
+fn bufSlice(buf: long, start: int, end: int): string {
+    let n = end - start;
+    if (n <= 0) { return ""; }
+    let out = bytes.alloc(n);
+    bytes.copy(out as long, buf + (start as long), n);
+    return out as string;
+}
+
+// A cursor over a RAW byte buffer region [start, lim). It reads directly from the reader's socket buffer
+// (no intermediate payload string), so decoding a DataRow allocates only the cells it actually keeps.
+// Construct from a string with `PgCursor(s as long, 0, s.length)` for the offline/cold paths.
 pub struct PgCursor {
-    pub s: string,
+    pub buf: long,
     pub pos: int,
-    init(s: string) { self.s = s; self.pos = 0; }
+    pub lim: int,
+    init(buf: long, start: int, end: int) { self.buf = buf; self.pos = start; self.lim = end; }
 
     pub fn byte(self: PgCursor): int {
-        let b = self.s[self.pos];
+        let b = bytes.read_byte(self.buf, self.pos);
         self.pos = self.pos + 1;
         return b;
     }
@@ -144,17 +190,100 @@ pub struct PgCursor {
     // A NUL-terminated C-string.
     pub fn cstr(self: PgCursor): string {
         let start = self.pos;
-        while (self.s[self.pos] != 0) { self.pos = self.pos + 1; }
-        let out = string.slice(self.s, start, self.pos);
+        while (bytes.read_byte(self.buf, self.pos) != 0) { self.pos = self.pos + 1; }
+        let out = bufSlice(self.buf, start, self.pos);
         self.pos = self.pos + 1;   // skip the NUL
         return out;
     }
     pub fn take(self: PgCursor, n: int): string {
-        let out = string.slice(self.s, self.pos, self.pos + n);
+        let out = bufSlice(self.buf, self.pos, self.pos + n);
         self.pos = self.pos + n;
         return out;
     }
     pub fn skip(self: PgCursor, n: int): void { self.pos = self.pos + n; }
+
+    // Parse a base-10 integer DIRECTLY from the next `n` wire bytes, without allocating an intermediate
+    // Nova string. Postgres text format for int2/int4/int8 is ASCII digits with an optional leading '-'.
+    // This removes one heap allocation per numeric column (the dominant cost of a wide result set).
+    pub fn takeI64(self: PgCursor, n: int): long {
+        let end = self.pos + n;
+        let i = self.pos;
+        let neg = false;
+        if (i < end) {
+            let c0 = bytes.read_byte(self.buf, i);
+            if (c0 == 45) { neg = true; i = i + 1; }       // '-'
+            else if (c0 == 43) { i = i + 1; }              // '+'
+        }
+        let acc: long = 0;
+        while (i < end) {
+            let c = bytes.read_byte(self.buf, i);
+            if (c < 48 || c > 57) { i = end; }             // stop at first non-digit
+            else { acc = acc * 10 + ((c - 48) as long); i = i + 1; }
+        }
+        self.pos = end;
+        if (neg) { return 0 - acc; }
+        return acc;
+    }
+
+    // Parse a floating-point value directly from the next `n` wire bytes (no intermediate string).
+    // Handles the plain `[-]ddd.ffff` text form Postgres emits for float4/float8.
+    pub fn takeF64(self: PgCursor, n: int): double {
+        let end = self.pos + n;
+        let i = self.pos;
+        let neg = false;
+        if (i < end && bytes.read_byte(self.buf, i) == 45) { neg = true; i = i + 1; }
+        let intPart = 0.0;
+        while (i < end) {
+            let c = bytes.read_byte(self.buf, i);
+            if (c == 46) { break; }                        // '.'
+            if (c >= 48 && c <= 57) { intPart = intPart * 10.0 + ((c - 48) as double); }
+            i = i + 1;
+        }
+        let frac = 0.0;
+        let scale = 1.0;
+        if (i < end && bytes.read_byte(self.buf, i) == 46) {
+            i = i + 1;
+            while (i < end) {
+                let c = bytes.read_byte(self.buf, i);
+                if (c >= 48 && c <= 57) { scale = scale / 10.0; frac = frac + ((c - 48) as double) * scale; }
+                i = i + 1;
+            }
+        }
+        self.pos = end;
+        let result = intPart + frac;
+        if (neg) { return 0.0 - result; }
+        return result;
+    }
+
+    // --- BINARY result decode (Bind result-format 1) -------------------------------------------------
+    // Fixed-width types arrive as big-endian bytes, not ASCII, so these read them directly (no digit
+    // loop, no fractional division). The byte assembly is done in the runtime (nova_pg_be_*) so it cannot
+    // trip Nova's checked-32-bit-int overflow trap.
+    pub fn binInt(self: PgCursor, n: int): int {
+        let v = nova_pg_be_i64(self.buf + (self.pos as long), n);
+        self.pos = self.pos + n;
+        return v as int;
+    }
+    pub fn binLong(self: PgCursor, n: int): long {
+        let v = nova_pg_be_i64(self.buf + (self.pos as long), n);
+        self.pos = self.pos + n;
+        return v;
+    }
+    pub fn binF64(self: PgCursor, n: int): double {
+        let d = nova_pg_be_f64(self.buf + (self.pos as long), n);
+        self.pos = self.pos + n;
+        return d;
+    }
+}
+
+// The fixed-width types the driver requests in BINARY result format (Bind result-format code 1) and
+// decodes via the binary readers above. Everything else (text/varchar/timestamp/uuid/json/decimal/bool/
+// bytea/array) is requested and decoded as TEXT -- for those, text is as cheap or cheaper AND composes
+// with the P4 lazy-borrow. buildBind and decodeDataRow BOTH key on this predicate, so the requested and
+// decoded formats are consistent by construction.
+pub fn isBinaryCol(t: DbType): bool {
+    return t == DbType.Int4 || t == DbType.Uint4 || t == DbType.Int8 || t == DbType.Uint8
+        || t == DbType.Float4 || t == DbType.Float8;
 }
 
 // --- Response decoders (pure; the offline gate calls these directly) ----------
@@ -163,7 +292,7 @@ pub struct PgCursor {
 /// col_attr(i16), type_oid(i32), type_size(i16), type_mod(i32), format(i16)}.
 pub fn decodeRowDesc(payload: string): List<Column> {
     let cols = List<Column>();
-    let c = PgCursor(payload);
+    let c = PgCursor(payload as long, 0, payload.length);
     let n = c.i16();
     let i = 0;
     while (i < n) {
@@ -180,20 +309,52 @@ pub fn decodeRowDesc(payload: string): List<Column> {
     return cols;
 }
 
-/// DataRow ('D'): field_count(i16) + per field {len(i32, -1=NULL), bytes}.
-pub fn decodeDataRow(payload: string, cols: List<Column>): Row {
+/// DataRow ('D'): field_count(i16) + per field {len(i32, -1=NULL), bytes}. Reads directly from the
+/// reader's socket buffer at [off, off+len) -- no payload string is allocated for the frame; only the
+/// kept cells are materialised (via c.take). The caller MUST decode before the next readFrame reuses the
+/// buffer (the query read loops do exactly that).
+pub fn decodeDataRow(buf: long, off: int, len: int, cols: List<Column>, binary: bool): Row {
     let row = Row();
-    let c = PgCursor(payload);
+    // P4 lazy/borrowed decode: copy the whole DataRow's bytes ONCE into an ARC string the Row owns, then
+    // let each string-carried cell borrow a slice of it instead of allocating its own copy. Columns the
+    // caller never reads are never materialised. `raw` keeps the borrowed bytes alive for the Row's life
+    // (copying the Row into the ResultSet ARC-retains it), so the cells are valid exactly while the Row is.
+    let raw = bufSlice(buf, off, off + len);
+    row.raw = raw;
+    let base = raw as long;
+    let c = PgCursor(buf, off, off + len);
     let n = c.i16();
     let i = 0;
     while (i < n) {
-        let len = c.i32();
+        let clen = c.i32();
         let col = cols.get(i) ?? Column("", DbType.Text);
         // -1 length = NULL; reads back as signed i32 -1 or 4294967295 depending on int width.
-        if (len == 4294967295 || len == -1) {
+        if (clen == 4294967295 || clen == -1) {
             row.cells.push(typemap.decodeCell(col.type_oid, "", true));
         } else {
-            row.cells.push(typemap.decodeCell(col.type_oid, c.take(len), false));
+            let t = col.type_oid;
+            let cellOff = c.pos - off;   // offset of this cell's bytes within `raw`
+            // Numeric fast paths. In BINARY result format (isBinaryCol requested) the bytes are fixed
+            // big-endian -> read them directly; otherwise parse the ASCII text form from the wire. Either
+            // way no per-cell string is allocated.
+            if (t == DbType.Int4 || t == DbType.Uint4) {
+                if (binary) { row.cells.push(db.dbInt(c.binInt(clen))); }
+                else { row.cells.push(db.dbInt(c.takeI64(clen) as int)); }
+            } else if (t == DbType.Int8 || t == DbType.Uint8) {
+                if (binary) { row.cells.push(db.dbLong(c.binLong(clen))); }
+                else { row.cells.push(db.dbLong(c.takeI64(clen))); }
+            } else if (t == DbType.Float4 || t == DbType.Float8) {
+                if (binary) { row.cells.push(db.dbDouble(c.binF64(clen))); }
+                else { row.cells.push(db.dbDouble(c.takeF64(clen))); }
+            } else if (t == DbType.Text || t == DbType.Timestamp || t == DbType.Uuid || t == DbType.Json || t == DbType.Decimal) {
+                // String-carried types decodeCell keeps verbatim: borrow the slice, defer the copy to
+                // asText()/asDecimal()/... so an unread column costs nothing beyond the shared row copy.
+                c.skip(clen);
+                row.cells.push(db.dbLazy(t, base, cellOff, clen));
+            } else {
+                // Bool / Array / Blob transform at decode -> materialise eagerly as before.
+                row.cells.push(typemap.decodeCell(t, c.take(clen), false));
+            }
         }
         i = i + 1;
     }
@@ -202,14 +363,14 @@ pub fn decodeDataRow(payload: string, cols: List<Column>): Row {
 
 /// CommandComplete ('C') -> tag cstring (e.g. "SELECT 2", "INSERT 0 1").
 pub fn decodeTag(payload: string): string {
-    let c = PgCursor(payload);
+    let c = PgCursor(payload as long, 0, payload.length);
     return c.cstr();
 }
 
 /// ErrorResponse ('E'): a series of {field_tag(byte), value(cstr)} ending at a 0 tag.
 /// We pull 'C' (SQLSTATE code) and 'M' (message).
 pub fn decodeError(payload: string): DbError {
-    let c = PgCursor(payload);
+    let c = PgCursor(payload as long, 0, payload.length);
     let code = "";
     let msg = "";
     let detail = "";
@@ -257,7 +418,7 @@ pub struct PgNotification {
 /// NotificationResponse ('A'): int32 process-id, then a NUL-terminated channel name,
 /// then a NUL-terminated payload string. Pure — the offline gate calls this directly.
 pub fn decodeNotification(payload: string): PgNotification {
-    let c = PgCursor(payload);
+    let c = PgCursor(payload as long, 0, payload.length);
     let pid = c.i32();
     let channel = c.cstr();
     let text = c.cstr();
@@ -277,7 +438,7 @@ pub struct PgCopyInfo {
 /// CopyOutResponse ('H') / CopyInResponse ('G') header: int8 overall format,
 /// int16 numColumns, then int16[numColumns] per-column formats (ignored here).
 pub fn decodeCopyResponse(payload: string): PgCopyInfo {
-    let c = PgCursor(payload);
+    let c = PgCursor(payload as long, 0, payload.length);
     let format = c.byte();
     let columns = c.i16();
     return PgCopyInfo(format, columns);

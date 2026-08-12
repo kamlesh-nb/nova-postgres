@@ -28,7 +28,7 @@ pub fn newScramClient(user: string, password: string): ScramClient {
 //   11 = AuthenticationSASLContinue -> server-first-message -> client-final
 //   12 = SASLFinal, 0 = Ok         -> nothing to send.  MD5 (5) is unsupported.
 pub async fn handleAuth(io: aio.AsyncIO, payload: string, user: string, password: string, scram: ScramClient): void {
-    let c = codec.PgCursor(payload);
+    let c = codec.PgCursor(payload as long, 0, payload.length);
     let kind = c.i32();
     if (kind == 3) {
         let a1 = await proto.sendFrame(io, codec.buildPassword(password));

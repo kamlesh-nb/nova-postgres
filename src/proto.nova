@@ -23,11 +23,8 @@ pub struct PgReader {
 }
 async fn fill(r: PgReader): bool {
     if (r.pos > 0) {
-        let i = 0;
-        while (r.pos + i < r.len) {
-            bytes.write_byte(r.buf, i, bytes.read_byte(r.buf, r.pos + i));
-            i = i + 1;
-        }
+        // Compact unread bytes to the front. bytes.copy is memmove, so the overlapping src/dst is safe.
+        bytes.copy(r.buf as long, (r.buf as long) + (r.pos as long), r.len - r.pos);
         r.len = r.len - r.pos;
         r.pos = 0;
     }
@@ -48,38 +45,67 @@ fn ri32(r: PgReader): int {
 }
 
 // A raw protocol frame: [type:byte][len:i32][payload]. `ftype == -1` = broken connection.
+// For the HOT DataRow ('D') path the payload is NOT materialised: `payload` is "" and (off,len) is a
+// view into the reader's buffer `r.buf`, which decodeDataRow reads directly before the next readFrame
+// reuses the buffer. Cold-path frames still carry a materialised `payload` string.
 pub struct PgFrame {
     pub ftype: int,
     pub payload: string,
-    init(ftype: int, payload: string) { self.ftype = ftype; self.payload = payload; }
+    pub off: int,
+    pub len: int,
+    init(ftype: int, payload: string, off: int, len: int) { self.ftype = ftype; self.payload = payload; self.off = off; self.len = len; }
 }
 pub async fn readFrame(r: PgReader): PgFrame {
-    if (!(await need(r, 5))) { return PgFrame(-1, ""); }
+    if (!(await need(r, 5))) { return PgFrame(-1, "", 0, 0); }
     let t = rbyte(r);
     let len = ri32(r);
     let plen = len - 4;
     // Defensive: a corrupt/partial length (server crashed mid-stream or protocol
     // desync) must not reach bytes.alloc — a negative or multi-GB plen segfaults the
     // client. Treat as a broken connection; callers already handle the -1 frame.
-    if (plen < 0 || plen > 67108864) { return PgFrame(-1, ""); }
+    if (plen < 0 || plen > 67108864) { return PgFrame(-1, "", 0, 0); }
     if (plen > 0) {
-        if (!(await need(r, plen))) { return PgFrame(-1, ""); }
+        if (!(await need(r, plen))) { return PgFrame(-1, "", 0, 0); }
     }
-    let out = bytes.alloc(plen);
-    let i = 0;
-    while (i < plen) {
-        bytes.write_byte(out, i, bytes.read_byte(r.buf, r.pos + i));
-        i = i + 1;
-    }
+    let off = r.pos;
     r.pos = r.pos + plen;
-    // Bind the `as string` cast to a local so ownership of the freshly-alloc'd buffer transfers to ARC and
-    // the payload is freed when the frame drops. An inline `PgFrame(t, out as string)` leaves the cast a
-    // borrow (a cast's ownership is intentionally ambiguous — see arc.zig), so the per-frame buffer leaks
-    // under load (a large per-row server leak). Binding first is the clean, explicit pattern (matches
-    // nova-novadb).
+    if (t == 68) {
+        // DataRow: ZERO-COPY. Return a view; decodeDataRow(r.buf, off, plen) reads cells straight from
+        // the reader buffer before the next readFrame compacts/refills it (the query loops decode
+        // immediately). No per-frame payload allocation on the hot path.
+        return PgFrame(t, "", off, plen);
+    }
+    // Cold-path frame (RowDescription/CommandComplete/Error/Notification/auth). Materialise the payload;
+    // bind the `as string` cast to a local so ARC owns the buffer and frees it when the frame drops.
+    let out = bytes.alloc(plen);
+    bytes.copy(out as long, (r.buf as long) + (off as long), plen);
     let payload = out as string;
-    return PgFrame(t, payload);
+    return PgFrame(t, payload, off, plen);
 }
+
+// SYNC frame parse: returns the next frame ONLY if it is fully buffered, WITHOUT awaiting. When the
+// frame is not yet complete it returns ftype -2 ("need more bytes") and leaves the read cursor
+// untouched, so the caller does exactly one `await fill` and retries. This removes the per-row
+// coroutine frame that `await readFrame` allocated for every DataRow: a 200-row response now parses
+// with ~4 awaits (one per socket fill) instead of ~200. Same zero-copy DataRow contract as readFrame.
+pub fn tryFrame(r: PgReader): PgFrame {
+    if (r.len - r.pos < 5) { return PgFrame(-2, "", 0, 0); }   // header not buffered yet
+    let savedPos = r.pos;
+    let t = rbyte(r);
+    let len = ri32(r);
+    let plen = len - 4;
+    if (plen < 0 || plen > 67108864) { return PgFrame(-1, "", 0, 0); }
+    if (r.len - r.pos < plen) { r.pos = savedPos; return PgFrame(-2, "", 0, 0); }   // rewind; need payload
+    let off = r.pos;
+    r.pos = r.pos + plen;
+    if (t == 68) { return PgFrame(t, "", off, plen); }   // DataRow: zero-copy view into r.buf
+    let out = bytes.alloc(plen);
+    bytes.copy(out as long, (r.buf as long) + (off as long), plen);
+    return PgFrame(t, out as string, off, plen);
+}
+
+// Async fill exposed to the driver's sync-frame loop (fill is module-private otherwise).
+pub async fn fillReader(r: PgReader): bool { return await fill(r); }
 
 pub async fn sendFrame(io: aio.AsyncIO, frame: string): int {
     return await io.sendStr(frame);
