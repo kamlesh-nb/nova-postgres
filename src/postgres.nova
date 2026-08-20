@@ -150,6 +150,13 @@ pub struct PgConnection impl Connection {
         // a timed-out query and drain its future), where a nested drive would deadlock nova_run_root.
         // An abrupt close is fine — the server tears the connection down.
         self.io.close();
+        // Free the reader's ~64 KB receive buffer. It is a raw `ptr` field (not an ARC-tracked object), so
+        // nothing releases it when the connection is dropped -- without this it leaked once per connection.
+        // Null it so a double close cannot double-free.
+        if ((self.reader.buf as long) != 0) {
+            bytes.free(self.reader.buf);
+            self.reader.buf = 0 as ptr;
+        }
     }
 
     pub fn setTimeout(self, ms: int): int {   // async per-recv awaited deadline
