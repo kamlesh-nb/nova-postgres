@@ -82,14 +82,14 @@ fn test_datarow_typed_decode(): void {
 
     // Row: id=10, name="widget", active="t"  (pg bool text is t/f).
     let dr = i16b(3) + i32b(2) + "10" + i32b(6) + "widget" + i32b(1) + "t";
-    let row = codec.decodeDataRow(dr, cols);
+    let row = codec.decodeDataRow(dr as long, 0, dr.length, cols, false);
     assert.equalInt(row.getInt(0), 10);
     assert.equalStr(row.getText(1), "widget");
     assert.isTrue(row.getBool(2));
 
     // NULL name: id=20, name=NULL (-1), active="f".
     let dr2 = i16b(3) + i32b(2) + "20" + i32b(4294967295) + i32b(1) + "f";
-    let row2 = codec.decodeDataRow(dr2, cols);
+    let row2 = codec.decodeDataRow(dr2 as long, 0, dr2.length, cols, false);
     assert.equalInt(row2.getInt(0), 20);
     assert.isTrue(row2.isNull(1));
     assert.isTrue(!row2.getBool(2));
@@ -155,7 +155,7 @@ fn test_timestamp_and_bytea_decode(): void {
     let ts = "2024-01-01 12:00:00+00";
     let bytea = "\\x48656c6c6f";                       // hex for "Hello"
     let dr = i16b(2) + i32b(ts.length) + ts + i32b(bytea.length) + bytea;
-    let row = codec.decodeDataRow(dr, cols);
+    let row = codec.decodeDataRow(dr as long, 0, dr.length, cols, false);
     assert.equalStr(row.getTimestamp(0), "2024-01-01 12:00:00+00");
     assert.equalStr(row.getText(1), "Hello");
 

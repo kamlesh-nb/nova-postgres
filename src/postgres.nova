@@ -528,6 +528,13 @@ async fn pgStartup(io: aio.AsyncIO, d: ConnectionOptions): PgConnection {
 
     let pid = 0;
     let secret = 0;
+    // SCRAM mutual auth (RFC 5802): remember the ServerSignature we expect, and refuse to finish the
+    // handshake unless the server proves it knows the password. `scramUsed` is set when we start SCRAM;
+    // `scramVerified` only when a SASLFinal's `v=` matches -- so a rogue server that skips or forges the
+    // final is rejected, not silently trusted.
+    let expectedServerSig = "";
+    let scramUsed = false;
+    let scramVerified = false;
     while (true) {
         let f = await proto.readFrame(reader);
         if (f.ftype == -1) { break; }
@@ -538,11 +545,26 @@ async fn pgStartup(io: aio.AsyncIO, d: ConnectionOptions): PgConnection {
             secret = kc.i32();
         }
         if (f.ftype == 82) {            // 'R' Authentication — delegate to auth
-            await auth.handleAuth(io, f.payload, d.user, d.password, scram);
+            // Verify a SASLFinal against the signature we computed at SASLContinue.
+            if (scramUsed && auth.isSaslFinal(f.payload)) {
+                if (!auth.verifyServerFinal(f.payload, expectedServerSig)) {
+                    io.close();
+                    nova_panic("postgres: SCRAM server signature mismatch (rogue/MITM server) -- refusing connection");
+                }
+                scramVerified = true;
+            }
+            let sig = await auth.handleAuth(io, f.payload, d.user, d.password, scram);
+            if (sig.length > 0) { expectedServerSig = sig; scramUsed = true; }
         }
         if (f.ftype == 69) {            // 'E' ErrorResponse during startup
             break;
         }
+    }
+    // Fail closed: if we did SCRAM but never verified the server's signature (e.g. the server jumped straight
+    // to ReadyForQuery), the mutual-auth guarantee is absent -- reject rather than trust.
+    if (scramUsed && !scramVerified) {
+        io.close();
+        nova_panic("postgres: SCRAM completed without a verified server signature -- refusing connection");
     }
     return PgConnection(io, reader, d.host, d.port, pid, secret);
 }

@@ -99,9 +99,14 @@ pub fn tryFrame(r: PgReader): PgFrame {
     let off = r.pos;
     r.pos = r.pos + plen;
     if (t == 68) { return PgFrame(t, "", off, plen); }   // DataRow: zero-copy view into r.buf
+    // Cold-path frame (CommandComplete/ReadyForQuery/Error/Notification). Materialise the payload;
+    // bind the `as string` cast to a local so ARC owns the buffer and frees it when the frame drops
+    // (a bare `PgFrame(t, out as string, ...)` leaks the buffer -- the cast temporary is retained by
+    // the field but never released). Mirrors readFrame.
     let out = bytes.alloc(plen);
     bytes.copy(out as long, (r.buf as long) + (off as long), plen);
-    return PgFrame(t, out as string, off, plen);
+    let payload = out as string;
+    return PgFrame(t, payload, off, plen);
 }
 
 // Async fill exposed to the driver's sync-frame loop (fill is module-private otherwise).

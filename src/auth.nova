@@ -27,7 +27,10 @@ pub fn newScramClient(user: string, password: string): ScramClient {
 //   10 = AuthenticationSASL        -> offer SCRAM-SHA-256 (client-first)
 //   11 = AuthenticationSASLContinue -> server-first-message -> client-final
 //   12 = SASLFinal, 0 = Ok         -> nothing to send.  MD5 (5) is unsupported.
-pub async fn handleAuth(io: aio.AsyncIO, payload: string, user: string, password: string, scram: ScramClient): void {
+// Returns the ServerSignature (base64) this client expects in the subsequent SASLFinal when it processes a
+// SASLContinue (kind 11); "" for every other message. The caller retains it and passes the SASLFinal
+// through `verifyServerFinal` -- the RFC 5802 mutual-authentication step that a rogue server cannot pass.
+pub async fn handleAuth(io: aio.AsyncIO, payload: string, user: string, password: string, scram: ScramClient): string {
     let c = codec.PgCursor(payload as long, 0, payload.length);
     let kind = c.i32();
     if (kind == 3) {
@@ -44,5 +47,26 @@ pub async fn handleAuth(io: aio.AsyncIO, payload: string, user: string, password
     if (kind == 11) {
         let serverFirst = c.take(payload.length - 4);
         let a3 = await proto.sendFrame(io, codec.buildSASLResponse(scram.clientFinalMessage(serverFirst)));
+        return scram.expectedServerSignature(serverFirst);
     }
+    return "";
+}
+
+// Verify a SASLFinal ('R' kind 12) payload against the ServerSignature the client expected. Non-final
+// messages verify vacuously (return true). A kind-12 message whose `v=` does not equal `expected` means the
+// server failed mutual authentication (RFC 5802 section 5).
+pub fn verifyServerFinal(payload: string, expected: string): bool {
+    let c = codec.PgCursor(payload as long, 0, payload.length);
+    let kind = c.i32();
+    if (kind != 12) { return true; }
+    let body = c.take(payload.length - 4);
+    let got = "";
+    if (string.startsWith(body, "v=")) { got = string.slice(body, 2, body.length); }
+    return string.eql(got, expected);
+}
+
+// Whether an 'R' payload is a SASLFinal (kind 12).
+pub fn isSaslFinal(payload: string): bool {
+    let c = codec.PgCursor(payload as long, 0, payload.length);
+    return c.i32() == 12;
 }
