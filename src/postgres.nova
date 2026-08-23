@@ -351,6 +351,24 @@ pub struct PgConnection impl Connection {
         return out;
     }
 
+    // Block awaiting the NEXT notification with no query in flight (the idle delivery loop the
+    // notifications() note calls for). Returns any already-buffered NOTIFY first; otherwise reads
+    // frames off the wire until an 'A' NotificationResponse (ftype 65) arrives and decodes it. On a
+    // closed/failed transport (ftype -1) it returns an empty PgNotification so the caller can stop.
+    // Used by the web layer's LISTEN-backed SSE stream to forward events pushed by pg_notify.
+    pub async fn waitNotification(self): PgNotification {
+        if (self.notes.size() > 0) {
+            let n = self.notes.get(0) ?? codec.PgNotification(0, "", "");
+            self.notes.remove(0);
+            return n;
+        }
+        while (true) {
+            let f = await proto.readFrame(self.reader);
+            if (f.ftype == -1) { return codec.PgNotification(0, "", ""); }
+            if (f.ftype == 65) { return codec.decodeNotification(f.payload); }
+        }
+    }
+
     // --- COPY OUT -------------------------------------------------------------
     // Run `COPY ... TO STDOUT` and collect each 'd' CopyData chunk as a string until 'c' CopyDone,
     // then drain 'C' CommandComplete / 'Z' ReadyForQuery. The offline gate exercises the pure
