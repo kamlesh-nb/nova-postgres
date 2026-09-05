@@ -1,4 +1,4 @@
-// postgres.nova — the PostgreSQL driver SEAM: PgConnection (impl db.Connection) and
+// postgres.ky — the PostgreSQL driver SEAM: PgConnection (impl db.Connection) and
 // PgDriver (impl db.Driver). This module orchestrates the connection lifecycle + the
 // request/response loops; every other responsibility lives in its own module (SOLID/SRP):
 //
@@ -41,8 +41,8 @@ import auth;
 
 // Per-request arena control (runtime). Used to suspend the region while writing the persistent
 // prepared-statement cache so those objects are NOT reclaimed at request end. No-op when no region.
-extern("c") fn nova_region_current(): long;
-extern("c") fn nova_region_set(r: long): void;
+extern("c") fn kyte_region_current(): long;
+extern("c") fn kyte_region_set(r: long): void;
 
 // --- The seam implementation --------------------------------------------------
 
@@ -147,7 +147,7 @@ pub struct PgConnection impl Connection {
     pub fn close(self): void {
         // Sync trait method — just close the socket. A graceful Terminate would need an async send,
         // which cannot be driven here: close is often called from INSIDE a coroutine (e.g. to cancel
-        // a timed-out query and drain its future), where a nested drive would deadlock nova_run_root.
+        // a timed-out query and drain its future), where a nested drive would deadlock kyte_run_root.
         // An abrupt close is fine — the server tears the connection down.
         self.io.close();
         // Free the reader's ~64 KB receive buffer. It is a raw `ptr` field (not an ARC-tracked object), so
@@ -175,7 +175,7 @@ pub struct PgConnection impl Connection {
             i = i + 1;
         }
         let idx = self.stmts.size();
-        let name = `nova_s${idx}`;
+        let name = `kyte_s${idx}`;
         let s1 = await proto.sendFrame(self.io, codec.buildParse(name, sql));
         let s2 = await proto.sendFrame(self.io, codec.buildDescribeStmt(name));
         let s3 = await proto.sendFrame(self.io, codec.buildSync());
@@ -194,8 +194,8 @@ pub struct PgConnection impl Connection {
         // request. Suspend the region (synchronously -- no await here) so the deep copy + the cache push
         // (and any List grow) land in the persistent default arena, then restore. Off the web path
         // (region == 0) this is a no-op pair around the same work.
-        let savedRegion = nova_region_current();
-        nova_region_set(0);
+        let savedRegion = kyte_region_current();
+        kyte_region_set(0);
         let pcols = List<Column>();
         let ci = 0;
         while (ci < cols.size()) {
@@ -204,7 +204,7 @@ pub struct PgConnection impl Connection {
             ci = ci + 1;
         }
         self.stmts.push(PgStmt(string.slice(name, 0, name.length), string.slice(sql, 0, sql.length), pcols));
-        nova_region_set(savedRegion);
+        kyte_region_set(savedRegion);
         return idx;
     }
 
@@ -433,7 +433,7 @@ pub struct PgRowSource impl RowBatchSource {
     pub e: DbError,
     init(conn: PgConnection, sql: string, params: List<DbValue>, batchSize: int) {
         self.conn = conn; self.sql = sql; self.params = params;
-        self.portal = "nova_cur"; self.batchSize = batchSize;
+        self.portal = "kyte_cur"; self.batchSize = batchSize;
         self.cols = List<Column>(); self.started = false; self.done = false; self.e = noError();
     }
 
@@ -574,7 +574,7 @@ async fn pgStartup(io: aio.AsyncIO, d: ConnectionOptions): PgConnection {
             if (scramUsed && auth.isSaslFinal(f.payload)) {
                 if (!auth.verifyServerFinal(f.payload, expectedServerSig)) {
                     io.close();
-                    nova_panic("postgres: SCRAM server signature mismatch (rogue/MITM server) -- refusing connection");
+                    kyte_panic("postgres: SCRAM server signature mismatch (rogue/MITM server) -- refusing connection");
                 }
                 scramVerified = true;
             }
@@ -589,7 +589,7 @@ async fn pgStartup(io: aio.AsyncIO, d: ConnectionOptions): PgConnection {
     // to ReadyForQuery), the mutual-auth guarantee is absent -- reject rather than trust.
     if (scramUsed && !scramVerified) {
         io.close();
-        nova_panic("postgres: SCRAM completed without a verified server signature -- refusing connection");
+        kyte_panic("postgres: SCRAM completed without a verified server signature -- refusing connection");
     }
     return PgConnection(io, reader, d.host, d.port, pid, secret);
 }

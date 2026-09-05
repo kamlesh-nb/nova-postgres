@@ -1,7 +1,7 @@
 // codec — the PostgreSQL v3 wire CODEC (SRP: bytes <-> messages). Frame BUILDERS
 // (startup/query/auth/extended-query) and response DECODERS (RowDescription, DataRow,
 // CommandComplete, ErrorResponse, NotificationResponse, Copy). Pure over byte-buffer
-// strings — the offline gate calls these directly; the connection (postgres.nova) wires
+// strings — the offline gate calls these directly; the connection (postgres.ky) wires
 // them to a live stream via proto. Type interpretation is delegated to typemap.
 import string;
 import list;
@@ -19,7 +19,7 @@ fn sbI32(sb: string_builder.StringBuilder, v: int): void {
 }
 fn sbCstr(sb: string_builder.StringBuilder, s: string): void { sb.append(s); sb.appendChar(0); }
 
-// --- PgFrame writers — binary-safe Nova strings ---------------------------------
+// --- PgFrame writers — binary-safe Kyte strings ---------------------------------
 fn byte1(b: int): string {
     let p = bytes.alloc(1);
     bytes.write_byte(p, 0, b);
@@ -49,7 +49,7 @@ fn typedFrame(t: int, payload: string): string {
 /// Startup: NO type byte. [len i32][protocol 196608][key\0 value\0 ...][\0].
 pub fn buildStartup(user: string, database: string): string {
     let params = cstr("user") + cstr(user) + cstr("database") + cstr(database)
-        + cstr("application_name") + cstr("nova-pg") + byte1(0);
+        + cstr("application_name") + cstr("kyte-pg") + byte1(0);
     let body = i32be(196608) + params;   // protocol 3.0 = 0x00030000
     return i32be(4 + body.length) + body;
 }
@@ -143,7 +143,7 @@ pub fn copyColumns(src: List<Column>): List<Column> {
         // DEEP-copy the name so the returned (per-request / arena) column list fully OWNS its strings. Under
         // the P7 request arena, `src` is the connection's PERSISTENT prepared-statement column cache; sharing
         // its name pointer would make ARC decrement the cached string when this request's list is released,
-        // draining the cache's refcount to zero after a few requests -> use-after-free (ASAN: nova_release).
+        // draining the cache's refcount to zero after a few requests -> use-after-free (ASAN: kyte_release).
         out.push(Column(string.slice(c.name, 0, c.name.length), c.type_oid));
         i = i + 1;
     }
@@ -151,7 +151,7 @@ pub fn copyColumns(src: List<Column>): List<Column> {
 }
 
 // --- Payload cursor (decode, pure over a byte-buffer string) ------------------
-// Copy [start,end) out of a raw byte buffer into a fresh Nova string (memcpy). This is the ONLY place a
+// Copy [start,end) out of a raw byte buffer into a fresh Kyte string (memcpy). This is the ONLY place a
 // cell/field is materialised; everything up to here is a view into the reader's buffer (zero-copy).
 fn bufSlice(buf: long, start: int, end: int): string {
     let n = end - start;
@@ -203,7 +203,7 @@ pub struct PgCursor {
     pub fn skip(self: PgCursor, n: int): void { self.pos = self.pos + n; }
 
     // Parse a base-10 integer DIRECTLY from the next `n` wire bytes, without allocating an intermediate
-    // Nova string. Postgres text format for int2/int4/int8 is ASCII digits with an optional leading '-'.
+    // Kyte string. Postgres text format for int2/int4/int8 is ASCII digits with an optional leading '-'.
     // This removes one heap allocation per numeric column (the dominant cost of a wide result set).
     pub fn takeI64(self: PgCursor, n: int): long {
         let end = self.pos + n;
@@ -257,20 +257,20 @@ pub struct PgCursor {
 
     // --- BINARY result decode (Bind result-format 1) -------------------------------------------------
     // Fixed-width types arrive as big-endian bytes, not ASCII, so these read them directly (no digit
-    // loop, no fractional division). The byte assembly is done in the runtime (nova_pg_be_*) so it cannot
-    // trip Nova's checked-32-bit-int overflow trap.
+    // loop, no fractional division). The byte assembly is done in the runtime (kyte_pg_be_*) so it cannot
+    // trip Kyte's checked-32-bit-int overflow trap.
     pub fn binInt(self: PgCursor, n: int): int {
-        let v = nova_pg_be_i64(self.buf + (self.pos as long), n);
+        let v = kyte_pg_be_i64(self.buf + (self.pos as long), n);
         self.pos = self.pos + n;
         return v as int;
     }
     pub fn binLong(self: PgCursor, n: int): long {
-        let v = nova_pg_be_i64(self.buf + (self.pos as long), n);
+        let v = kyte_pg_be_i64(self.buf + (self.pos as long), n);
         self.pos = self.pos + n;
         return v;
     }
     pub fn binF64(self: PgCursor, n: int): double {
-        let d = nova_pg_be_f64(self.buf + (self.pos as long), n);
+        let d = kyte_pg_be_f64(self.buf + (self.pos as long), n);
         self.pos = self.pos + n;
         return d;
     }

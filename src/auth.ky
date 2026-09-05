@@ -1,6 +1,6 @@
 // auth — the authentication exchange (SRP: auth only). Owns the SCRAM-SHA-256 /
 // cleartext response to the server's Authentication ('R') messages, keeping the startup
-// handshake (postgres.nova) free of auth-mechanism detail. The auth frames themselves are
+// handshake (postgres.ky) free of auth-mechanism detail. The auth frames themselves are
 // built by codec; this module decides WHICH to send for a given 'R' message and drives
 // the ScramClient state across the multi-message SCRAM exchange.
 import net.aio;
@@ -14,7 +14,7 @@ import proto;
 // `md5.md5` already returns the 32-char lowercase-hex digest, so MD5 auth composes it directly.
 
 // Build the per-connection SCRAM client. The client nonce is 36 hex chars from the
-// pure-Nova CSPRNG (crypto/random over /dev/urandom). One instance lives across the whole
+// pure-Kyte CSPRNG (crypto/random over /dev/urandom). One instance lives across the whole
 // SCRAM exchange (client-first -> server-first -> client-final).
 pub fn newScramClient(user: string, password: string): ScramClient {
     return ScramClient{ username: user, password: password, clientNonce: random.randomHex(18) };

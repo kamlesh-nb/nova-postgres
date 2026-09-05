@@ -2,7 +2,7 @@
 // The Parse name, the SQL (for dedup), and the RowDescription columns captured at
 // Describe time (Execute never resends them). The Parse/Bind/Execute wire frames live
 // in codec; the prepare/queryPrepared/execPrepared orchestration lives on the
-// connection (postgres.nova). This is just the cached handle model.
+// connection (postgres.ky). This is just the cached handle model.
 import list;
 import db;
 

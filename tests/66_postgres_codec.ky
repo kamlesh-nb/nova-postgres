@@ -1,4 +1,4 @@
-// The PostgreSQL driver's wire CODEC (data/sql/postgres.nova) — gated OFFLINE against
+// The PostgreSQL driver's wire CODEC (data/sql/postgres.ky) — gated OFFLINE against
 // hand-built byte buffers matching the pg v3 protocol, so encode/decode is verified without
 // a live server (the driver is separately live-verified against a running PostgreSQL).
 // Covers: Startup (no type byte) + Query framing, typed RowDescription (cstring names + pg

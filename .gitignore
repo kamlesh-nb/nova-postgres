@@ -1,7 +1,7 @@
-__nova_test
-__nova_test.ll
+__kyte_test
+__kyte_test.ll
 *.o
 *.ll
-merged.nova
+merged.ky
 build/
-.nova/
+.kyte/

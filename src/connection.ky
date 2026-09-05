@@ -1,6 +1,6 @@
 // connection: PostgreSQL connection-string parsing (SRP: connection string only).
 // `postgresql://user[:password]@host[:port]/database?sslmode=...&sslrootcert=...`
-// Pure string work; no I/O, no db seam. The seam (postgres.nova) turns a ConnectionOptions into a
+// Pure string work; no I/O, no db seam. The seam (postgres.ky) turns a ConnectionOptions into a
 // live connection.
 import string;
 import bytes;

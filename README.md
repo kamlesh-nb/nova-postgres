@@ -1,12 +1,12 @@
 # nova-postgres
 
-PostgreSQL wire-protocol driver for Nova (SCRAM auth, server-side prepared statements) on the async runtime. A Nova package — fetch with:
+PostgreSQL wire-protocol driver for Kyte (SCRAM auth, server-side prepared statements) on the async runtime. A Kyte package — fetch with:
 
 ```sh
-nova get https://github.com/kamlesh-nb/nova-postgres
+kyte get https://github.com/kamlesh-nb/nova-postgres
 ```
 
-```nova
+```kyte
 import postgres;
 
 let drv  = PgDriver();
@@ -29,5 +29,5 @@ touch the seam (`PgDriver` / `PgConnection`); the rest are internal modules.
 | `stmt`     | Prepared-statement cache entry (`PgStmt`).                         |
 | `auth`     | The SCRAM-SHA-256 / cleartext auth exchange.                       |
 
-The pure halves (`codec` / `typemap`) are offline-gated (`tests/66_postgres_codec.nova`);
+The pure halves (`codec` / `typemap`) are offline-gated (`tests/66_postgres_codec.ky`);
 `connect`/`query` wire them to a socket and are live-verified against a running PostgreSQL.
